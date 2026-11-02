@@ -50,8 +50,10 @@ def usage() -> str:
                   and keep their paths (default: unset; $PUBLIC_URL). Without it, a loopback entityID
                   and ACS follow the running demo's PORT, then $PORT. A non-loopback URL is left as written.
   --test-user     The test user to create (default: saml-demo-user). Its password is
-                  $SAML_DEMO_USER_PASSWORD, or one is generated and printed once. With
-                  $SAML_DEMO_USER_PASSWORD set, an existing user's password is replaced.
+                  $SAML_DEMO_USER_PASSWORD, or one is generated and written to
+                  generated/<user>.password beside the configuration (mode 0600); only the
+                  path is printed. With $SAML_DEMO_USER_PASSWORD set, an existing user's
+                  password is replaced.
   --no-test-user  Do not create a test user.
   --dry-run       Print what would be done, and send nothing.
 
@@ -307,6 +309,7 @@ def _request(url: str, method: str, headers: dict, body: bytes | None, ca: str |
     context = None
     if url.startswith("https://"):
         context = ssl.create_default_context()
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
         if ca:
             context.load_verify_locations(cadata=ca)
     try:
@@ -476,7 +479,16 @@ def main(argv: list[str] | None = None) -> None:
                 raise SystemExit(f"creating {args.test_user} was refused: {json.dumps(made['body'])[:300]}")
             print(f"Created user {args.test_user}.")
             if made["body"].get("password"):
-                print(f"Generated password for {args.test_user} (shown once): {made['body']['password']}")
+                # Never printed: a password does not belong in a log. It goes to a
+                # file only its owner can read, created 0600, in demo/generated,
+                # which never enters an image (.dockerignore admits only idpCa's chain).
+                saved = Path(args.config).resolve().parent / "generated" / f"{args.test_user}.password"
+                saved.parent.mkdir(parents=True, exist_ok=True)
+                descriptor = os.open(saved, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as out:
+                    os.fchmod(out.fileno(), 0o600)
+                    out.write(f"{made['body']['password']}\n")
+                print(f"Generated a password for {args.test_user}; it is in {saved} (readable by you only).")
     print("Done. Start the demo with: docker compose up --build")
 
 

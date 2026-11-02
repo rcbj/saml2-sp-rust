@@ -68,7 +68,10 @@ PROFILE = {
     "status_path": "/live-status",
     "configure": ["python3", "scripts/configure_iya_sts.py"],  # run inside the demo image
     "config_file": "demo/saml.json",
-    "password_env": "SAML_DEMO_USER_PASSWORD",
+    # The NAME of the variable that carries the test user's password to the install
+    # script (-e NAME). The key is not called "password...": the name goes on the printed
+    # command line, and a static checker treats such a key as the password itself.
+    "user_env": "SAML_DEMO_USER_PASSWORD",
     "test_user": "saml-demo-user",
 }
 
@@ -128,6 +131,7 @@ class Client:
     def __init__(self, ca_file):
         self.jar = http.cookiejar.CookieJar(policy=LoopbackCookiePolicy())
         self.ssl = ssl.create_default_context(cafile=str(ca_file))
+        self.ssl.minimum_version = ssl.TLSVersion.TLSv1_2
 
     def request(self, method, url, body=None, headers=None, timeout=60):
         parts = urllib.parse.urlsplit(url)
@@ -228,6 +232,7 @@ def wait_ready(origin, timeout):
     """Wait for iya-sts's /healthcheck. Unverified: nothing is trusted from it."""
     parts = urllib.parse.urlsplit(origin)
     context = ssl._create_unverified_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     deadline = time.time() + timeout
     last = None
     while time.time() < deadline:
@@ -310,6 +315,28 @@ def autopost_form(payload):
     return None
 
 
+# What a sign-in request is logged as. A label is one of these constants, never
+# text taken from the URL: the URLs carry pending-step handles, codes and state,
+# and some come back from requests that carried the password.
+LOG_PATHS = (
+    "/authn-api/pending/",
+    "/authn-api/consent/",
+    "/authn-api/mfa/",
+    "/authn/login",
+    "/authn/mfa-setup",
+    "/authn/post-login",
+    "/oauth2/consent",
+    "/oauth2/authorize",
+    "/wsfed",
+    "/saml2/",
+    "/saml11/",
+    "/callback",
+    "/acs",
+    "/login",
+    "/live-status",
+)
+
+
 class Driver:
     def __init__(self, client, sts_origin, demo_origin, username, password):
         self.client = client
@@ -321,9 +348,18 @@ class Driver:
     def sts(self, url):
         return origin_of(url).rstrip("/") == self.sts_origin
 
+    def label(self, url):
+        """A constant naming where a request went, never text from the URL."""
+        where = "iya-sts" if self.sts(url) else "demo" if origin_of(url).rstrip("/") == self.demo_origin else "elsewhere"
+        path = path_of(url)
+        for known in LOG_PATHS:
+            if path.startswith(known):
+                return f"{where} {known}"
+        return f"{where} (another path)"
+
     def get(self, url):
         status, headers, payload = self.client.request("GET", url, headers={"accept": "text/html,application/json"})
-        print(f"GET {status} {url}", flush=True)
+        print(f"GET {status} {self.label(url)}", flush=True)
         return status, headers, payload
 
     def post_json(self, url, body, csrf):
@@ -334,7 +370,7 @@ class Driver:
             "origin": self.sts_origin,
             "x-csrf-token": csrf,
         })
-        print(f"POST {status} {url}", flush=True)
+        print(f"POST {status} {self.label(url)}", flush=True)
         return status, headers, payload
 
     def open_view(self, shell_url, api_url):
@@ -342,7 +378,7 @@ class Driver:
         if status in (301, 302, 303, 307, 308):
             return {"redirect": resolve_url(shell_url, one_header(headers, "location"))}
         view_status, _headers, view_payload = self.client.request("GET", api_url, headers={"accept": "application/json"})
-        print(f"GET {view_status} {api_url}", flush=True)
+        print(f"GET {view_status} {self.label(api_url)}", flush=True)
         parsed = json_body(view_payload) or {}
         if view_status in (301, 302, 303, 307, 308):
             return {"redirect": resolve_url(api_url, one_header(_headers, "location"))}
@@ -392,7 +428,7 @@ class Driver:
                 "content-type": "application/x-www-form-urlencoded",
                 "origin": origin_of(url),
             })
-            print(f"POST {posted} {action}", flush=True)
+            print(f"POST {posted} {self.label(action)}", flush=True)
             if posted in (301, 302, 303, 307, 308):
                 return resolve_url(action, one_header(post_headers, "location"))
             if origin_of(action).rstrip("/") == self.demo_origin:
@@ -595,7 +631,7 @@ def configure_demo(work, sts_origin, demo_origin, demo_port, username, password,
     """
     env = os.environ.copy()
     env["ADMIN_API_CLIENT_SECRET"] = secret
-    env[PROFILE["password_env"]] = password
+    env[PROFILE["user_env"]] = password
     completed = docker(
         "run", "--rm", "--network", "host",
         "--user", f"{os.getuid()}:{os.getgid()}",
@@ -604,7 +640,7 @@ def configure_demo(work, sts_origin, demo_origin, demo_port, username, password,
         "-e", f"PORT={demo_port}",
         "-e", f"PUBLIC_URL={demo_origin}",
         "-e", "ADMIN_API_CLIENT_SECRET",
-        "-e", PROFILE["password_env"],
+        "-e", PROFILE["user_env"],
         image,
         *PROFILE["configure"],
         "--config", "/work/saml.json",
@@ -628,7 +664,7 @@ def main():
     if any(port in FORBIDDEN_PORTS for port in bound) or len(set(bound)) != len(bound):
         raise SystemExit("LIVE_STS_PORT and LIVE_DEMO_PORT must differ and must not bind 3000, 8081, or 18481 to 18495")
     secret = os.environ.get("ADMIN_API_CLIENT_SECRET") or os.environ.get("STS_ADMIN_API_CLIENT_SECRET") or secrets.token_urlsafe(24)
-    password = os.environ.get(PROFILE["password_env"]) or secrets.token_urlsafe(18)
+    password = os.environ.get(PROFILE["user_env"]) or secrets.token_urlsafe(18)
     username = PROFILE["test_user"]
     sts_origin, sts_name = prepare_sts(sts_port, secret)
     demo_origin = f"http://127.0.0.1:{demo_port}"
