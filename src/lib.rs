@@ -43,6 +43,8 @@ mod sp_test;
 #[cfg(test)]
 mod ssf_test;
 #[cfg(test)]
+mod plain_http_test;
+#[cfg(test)]
 mod configure_test;
 #[cfg(test)]
 mod trust_chain_test;
