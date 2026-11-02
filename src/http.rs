@@ -25,6 +25,7 @@ pub(crate) fn send(raw_url: &str, method: &str, headers: &[(&str, &str)], body: 
     if !(raw_url.starts_with("https://") || raw_url.starts_with("http://")) {
         return Err(err(code, format!("{raw_url} is not an http(s) URL")));
     }
+    refuse_whitespace_or_control(raw_url, code)?;
     // Every fetch this library makes comes through here: the identity
     // provider's metadata (its signing keys), the ArtifactResolve (the signed
     // request out, the assertion back) and the Shared Signals transmitter
@@ -62,7 +63,9 @@ pub(crate) fn send(raw_url: &str, method: &str, headers: &[(&str, &str)], body: 
             }
         };
         if matches!(status, 301 | 302 | 303 | 307 | 308) && hop < MAX_REDIRECTS {
-            if let Some(next) = response.header("location").and_then(|location| url.as_url().join(location).ok()) {
+            let location = response.header("location").unwrap_or("").to_string();
+            refuse_whitespace_or_control(&location, code)?;
+            if let Some(next) = url.as_url().join(&location).ok().filter(|_| !location.is_empty()) {
                 // As ureq does: never from https down to http, and never to
                 // anything but http(s); then the 3xx is the answer.
                 let downgrade = url.as_url().scheme() == "https" && next.scheme() == "http";
@@ -90,6 +93,17 @@ pub(crate) fn send(raw_url: &str, method: &str, headers: &[(&str, &str)], body: 
 }
 
 const MAX_REDIRECTS: u32 = 5;
+
+/// Refuses a URL holding whitespace or a control character. The URL parser
+/// ureq uses silently drops tabs and newlines and trims spaces, so such a URL
+/// can name one host to a reader and another to the dial; none is ever valid.
+/// The message never repeats the URL.
+fn refuse_whitespace_or_control(raw: &str, code: &str) -> Result<(), SamlError> {
+    if raw.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(err(code, "the URL is refused: it holds whitespace or a control character"));
+    }
+    Ok(())
+}
 
 /// Refuses a plain http URL unless its host is loopback: 127.0.0.0/8, ::1 or
 /// the name localhost, where the bytes never leave the machine. The URL is the

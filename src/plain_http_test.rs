@@ -139,6 +139,48 @@ fn refuses_a_redirect_to_plain_http_off_loopback() {
 }
 
 #[test]
+fn refuses_whitespace_or_control_characters() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    for url in [
+        format!("http://127.0.0.1:{port}/m\td"),
+        format!("http://127.0.0.1:{port}/m d"),
+        format!("http://local\nhost:{port}/md"),
+        format!("https://127.0.0.1:{port}/m\r\nd"),
+        format!("http://127.0.0.1:{port}/md\u{7f}"),
+    ] {
+        let err = failure(sp_from(&url));
+        assert_eq!(err.code, "metadata", "{}", err.message);
+        assert!(err.message.contains("whitespace or a control character"), "{}", err.message);
+    }
+    for transmitter in [format!("http://127.0.0.1:{port}/s\tsf"), format!("http://127.0.0.1:{port}/s sf")] {
+        let err = failure(start_receiver(&transmitter));
+        assert_eq!(err.code, "ssf", "{}", err.message);
+    }
+    let err = failure(resolve(&format!("http://127.0.0.1:{port}/a\nrs")));
+    assert_eq!(err.code, "artifact", "{}", err.message);
+    listener.set_nonblocking(true).unwrap();
+    thread::sleep(Duration::from_millis(200));
+    assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock), "a refused fetch opened a connection");
+}
+
+#[test]
+fn refuses_a_redirect_holding_whitespace() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(b"HTTP/1.1 302 Found\r\nlocation: http://local\thost.example.com/md\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+        }
+    });
+    let err = failure(sp_from(&format!("http://127.0.0.1:{port}/away")));
+    assert_eq!(err.code, "metadata", "{}", err.message);
+    assert!(err.message.contains("whitespace or a control character"), "{}", err.message);
+}
+
+#[test]
 fn plain_http_to_loopback_still_works() {
     let hits = Arc::new(AtomicUsize::new(0));
     let server = counting_server(hits.clone());
