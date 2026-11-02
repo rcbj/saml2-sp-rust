@@ -1,0 +1,14 @@
+{
+  "entityId": "http://localhost:3000/saml/metadata",
+  "acsUrl": "http://localhost:3000/saml/acs",
+  "privateKey": "file:generated/sp.key",
+  "certificate": "file:generated/sp.crt",
+  "idpMetadata": "file:generated/idp-metadata.xml",
+  "idpCa": "file:generated/idp-ca.pem",
+  "responseBinding": "post",
+  "wantAssertionsEncrypted": true,
+  "ssf": {
+    "transmitter": "https://localhost:8081",
+    "pollIntervalMs": 3000
+  }
+}

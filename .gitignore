@@ -1,0 +1,9 @@
+/target
+demo/generated/
+bin/
+*.exe
+*.test
+__pycache__/
+*.pyc
+venv/
+.venv/
