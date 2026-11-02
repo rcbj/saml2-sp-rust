@@ -57,6 +57,35 @@ pub(crate) fn send(raw_url: &str, method: &str, headers: &[(&str, &str)], body: 
     Ok(HttpAnswer { status, body })
 }
 
+/// Every certificate in `ca`, each one a root of the trust store.
+///
+/// `ca` is a PEM file that may hold a whole chain, as iya-sts publishes it at
+/// `GET /tls/server-certificate`: leaf, TLS Issuing CA, Intermediate, Root.
+/// `native_tls::Certificate::from_pem` reads only the first block, which is the
+/// leaf; OpenSSL then cannot end the path at a self-signed certificate and
+/// refuses the handshake. So each block is read and added, and the Root is
+/// among them.
+pub(crate) fn trust_anchors(ca: &str) -> Result<Vec<native_tls::Certificate>, String> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    let mut out = Vec::new();
+    let mut rest = ca;
+    while let Some(start) = rest.find(BEGIN) {
+        let Some(length) = rest[start..].find(END) else {
+            return Err("the CA certificate cannot be read: a PEM block has no END line".to_string());
+        };
+        let block = &rest[start..start + length + END.len()];
+        let certificate = native_tls::Certificate::from_pem(block.as_bytes())
+            .map_err(|e| format!("the CA certificate cannot be read: {e}"))?;
+        out.push(certificate);
+        rest = &rest[start + length + END.len()..];
+    }
+    if out.is_empty() {
+        return Err("the CA certificate cannot be read: it holds no PEM certificate".to_string());
+    }
+    Ok(out)
+}
+
 fn agent(tls: Option<&TlsOptions>, code: &str) -> Result<ureq::Agent, SamlError> {
     let mut builder = ureq::AgentBuilder::new().timeout(Duration::from_secs(15));
     if let Some(opt) = tls {
@@ -64,8 +93,9 @@ fn agent(tls: Option<&TlsOptions>, code: &str) -> Result<ureq::Agent, SamlError>
             let mut tls_builder = native_tls::TlsConnector::builder();
             tls_builder.min_protocol_version(Some(native_tls::Protocol::Tlsv12));
             if !opt.ca.is_empty() {
-                let ca = native_tls::Certificate::from_pem(opt.ca.as_bytes()).map_err(|_| err(code, "the CA certificate cannot be read"))?;
-                tls_builder.add_root_certificate(ca);
+                for ca in trust_anchors(&opt.ca).map_err(|message| err(code, message))? {
+                    tls_builder.add_root_certificate(ca);
+                }
             }
             if !opt.cert.is_empty() && !opt.key.is_empty() {
                 let identity = native_tls::Identity::from_pkcs8(opt.cert.as_bytes(), opt.key.as_bytes()).map_err(|e| err(code, format!("the client certificate cannot be read: {e}")))?;

@@ -44,3 +44,5 @@ mod sp_test;
 mod ssf_test;
 #[cfg(test)]
 mod configure_test;
+#[cfg(test)]
+mod trust_chain_test;
