@@ -18,16 +18,18 @@ docker build --target test .
 
 The `test` stage runs `cargo test` in `rust:1`. GitHub Actions uses that command. Do not run Cargo on the host. The demo image does not run the suite.
 
-Signatures and decryption are real. The stub identity provider signs with this crate's exclusive canonicalization and is created inside the tests. No live iya-sts.
+Signatures and decryption are real. The stub identity provider signs with this crate's exclusive canonicalization and is created inside the tests.
+
+`python3 scripts/live_iya_sts.py` signs the demo in to a fresh iya-sts (main, memory mode, no persistence, no clustering) and checks credential-change and session-revoked on `GET /live-status`. `IYA_STS_URL` uses a running iya-sts; `IYA_STS_IMAGE` starts one from an image; otherwise it clones and builds main. The registrar runs inside the demo image, never with Cargo on the host. Default ports 18518 (iya-sts) and 18618 (demo), `LIVE_STS_PORT` / `LIVE_DEMO_PORT`; it refuses 3000, 8081, and 18481 to 18495. Always a fresh iya-sts: a second registration of the same SP fails. `.github/workflows/nightly.yml` runs the unit suite and that script at 07:10 UTC (`10 7 * * *`) and on `workflow_dispatch`. Push CI stays the unit suite.
 
 ## Layout
 
-Crate `saml2-sp` (edition 2021), binaries `saml2-sp` and `demo`, `scripts/configure_iya_sts.py`, `Dockerfile`, `docker-compose.yml`. The image name is `saml2-sp-rust-demo`. Compose uses `network_mode: host`, service `saml-demo`, and `ENV PORT=3000` in the image. The health check is `http://127.0.0.1:${PORT}/healthz`.
+Crate `saml2-sp` (edition 2021), binaries `saml2-sp` and `demo`, `scripts/configure_iya_sts.py`, `scripts/live_iya_sts.py`, `.github/workflows/nightly.yml`, `Dockerfile`, `docker-compose.yml`. The image name is `saml2-sp-rust-demo`. Compose uses `network_mode: host`, service `saml-demo`, and `ENV PORT=3000` in the image. The health check is `http://127.0.0.1:${PORT}/healthz`.
 
 ## Demo
 
-`docker compose up --build`. `GET /healthz` is `200` with body `ok`. Pages: sign-in, `/login` (redirect or POST form), `/saml/acs`, and logout, plus metadata. Loopback entityID and assertion-consumer URLs follow `PORT`. Other hosts stay as written. `PUBLIC_URL` or `--public-url` replaces the origin and keeps the path. The default `http://localhost:3000` is not an explicit public URL. `demo/saml.json` uses `file:` placeholders and omits `signals`. Do not commit `demo/generated/`.
+`docker compose up --build`. `GET /healthz` is `200` with body `ok`. Pages: sign-in, `/login` (redirect or POST form), `/saml/acs`, and logout, plus metadata. `GET /live-status` is JSON `{signedIn, subject, receiver, events: [{type, jti}]}`, never an assertion. When `session-revoked` matched no tracked session (the assertion SessionIndex was the assertion id), the demo ends its one local session and untracks it; that is demo code, not the library. Loopback entityID and assertion-consumer URLs follow `PORT`. Other hosts stay as written. `PUBLIC_URL` or `--public-url` replaces the origin and keeps the path. The default `http://localhost:3000` is not an explicit public URL. `demo/saml.json` uses `file:` placeholders and omits `signals`. Do not commit `demo/generated/`.
 
 ## Signals
 
-With an `ssf` block and without `"signals": false`, the demo starts one poll receiver on the service provider's certificate (mutual TLS). `stop` waits for an in-flight poll. `scripts/configure_iya_sts.py` registers the SP metadata, pins AES-256-GCM / RSA-OAEP, turns on multiple accounts, and, unless signals are off, grants `ssf.manage`. The container `PORT` wins over the shell `PORT` at registration.
+With an `ssf` block and without `"signals": false`, the demo starts one poll receiver on the service provider's certificate (mutual TLS). `stop` waits for an in-flight poll. `scripts/configure_iya_sts.py` uses the `saml2-sp` binary on `PATH` (falling back to `cargo run`), registers the SP metadata, pins AES-256-GCM / RSA-OAEP, turns on multiple accounts, and, unless signals are off, grants `ssf.manage`. The container `PORT` wins over the shell `PORT` at registration.
