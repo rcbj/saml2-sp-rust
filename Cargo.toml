@@ -3,8 +3,14 @@ name = "saml2-sp"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+authors = ["rcbjBlueMars <9321971+rcbjBlueMars@users.noreply.github.com>"]
 description = "SAML 2.0 service provider"
-publish = false
+repository = "https://github.com/rcbj/saml2-sp-rust"
+homepage = "https://github.com/rcbj/saml2-sp-rust"
+documentation = "https://docs.rs/saml2-sp"
+readme = "README.md"
+keywords = ["saml", "saml2", "sso", "caep"]
+categories = ["authentication"]
 
 [dependencies]
 aes = "0.8"
