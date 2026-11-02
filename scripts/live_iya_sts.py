@@ -14,6 +14,15 @@ It uses the host's standard-library Python and Docker, and no Rust toolchain.
 The demo runs in a container. Configuring the client is
 `python3 scripts/configure_iya_sts.py` run INSIDE the demo image, where the
 saml2-sp binary makes the keys and the metadata; cargo never runs on the host.
+
+The order is the one a user follows. The checkout is copied to a scratch build
+context (never demo/generated, .git or target). The registrar runs against that
+copy and writes iya-sts's listener CA trust chain where idpCa names it
+(demo/generated/idp-ca.pem). THEN the demo image is built from the copy, which
+bakes that chain in, and THEN the demo runs from it. Nothing here fetches the CA
+for the demo, rewrites idpCa, or mounts a CA into the demo container: only the
+SP key pair and the IdP metadata are mounted, file by file. This script reads
+the saved chain for its own HTTPS client.
 Do not bind port 3000, 8081, or 18481 to 18495. The defaults are 18518 (iya-sts)
 and 18618 (the demo); LIVE_STS_PORT and LIVE_DEMO_PORT replace them.
 
@@ -215,19 +224,43 @@ def wait_port(port, timeout):
     raise RuntimeError(f"127.0.0.1:{port} did not accept a connection")
 
 
-def fetch_ca(origin, dest):
+def wait_ready(origin, timeout):
+    """Wait for iya-sts's /healthcheck. Unverified: nothing is trusted from it."""
     parts = urllib.parse.urlsplit(origin)
     context = ssl._create_unverified_context()
-    conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, context=context, timeout=30)
-    try:
-        conn.request("GET", "/tls/server-certificate")
-        response = conn.getresponse()
-        body = response.read()
-    finally:
-        conn.close()
-    if response.status != 200 or b"BEGIN CERTIFICATE" not in body:
-        raise RuntimeError(f"GET /tls/server-certificate answered {response.status}")
-    dest.write_bytes(body)
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        try:
+            conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, context=context, timeout=10)
+            try:
+                conn.request("GET", "/healthcheck")
+                response = conn.getresponse()
+                response.read()
+            finally:
+                conn.close()
+            if response.status == 200:
+                return
+            last = f"answered {response.status}"
+        except OSError as err:
+            last = str(err)
+        time.sleep(2)
+    raise RuntimeError(f"{origin}/healthcheck was not ready: {last}")
+
+
+def copy_context(dest):
+    """Copy the checkout to a build context, without .git, target or demo/generated."""
+
+    def ignore(directory, names):
+        here = Path(directory).resolve()
+        skipped = {".git", "__pycache__"} & set(names)
+        if here == ROOT:
+            skipped |= {"target"} & set(names)
+        if here == ROOT / "demo":
+            skipped |= {"generated"} & set(names)
+        return skipped
+
+    shutil.copytree(ROOT, dest, ignore=ignore)
 
 
 def rewrite_config(source, dest, sts_origin, demo_origin):
@@ -604,33 +637,34 @@ def main():
     work = Path(tempfile.mkdtemp(prefix=PROFILE["repo"] + "-live-"))
     try:
         wait_port(urllib.parse.urlsplit(sts_origin).port or 443, 120)
-        ca_file = work / "idp-ca.pem"
-        deadline = time.time() + 90
-        last_error = None
-        while time.time() < deadline:
-            try:
-                fetch_ca(sts_origin, ca_file)
-                last_error = None
-                break
-            except Exception as err:
-                last_error = err
-                time.sleep(2)
-        if last_error:
-            raise last_error
-        # demo/generated/idp-ca.pem is left to the registrar: it saves the last
-        # certificate the handshake presents (the root). The demo's OpenSSL
-        # will not anchor on the leaf that /tls/server-certificate answers.
-        config = work / "saml.json"
-        rewrite_config(ROOT / PROFILE["config_file"], config, sts_origin, demo_origin)
-        docker("build", "-t", image, str(ROOT))
-        configure_demo(work, sts_origin, demo_origin, demo_port, username, password, secret, image)
+        wait_ready(sts_origin, 90)
+        context = work / "context"
+        copy_context(context)
+        demo_dir = context / "demo"
+        rewrite_config(ROOT / PROFILE["config_file"], demo_dir / "saml.json", sts_origin, demo_origin)
+        # The registrar runs in the demo image, so build it once without a chain
+        # (as a fresh clone would), let the registrar write the chain where idpCa
+        # names it, then build again: only the demo/ layer changes.
+        docker("build", "-t", image, str(context))
+        configure_demo(demo_dir, sts_origin, demo_origin, demo_port, username, password, secret, image)
+        ca_file = demo_dir / "generated" / "idp-ca.pem"
+        if not ca_file.exists():
+            raise RuntimeError(f"the registrar did not write {ca_file}")
+        docker("build", "-t", image, str(context))
+        baked = docker("run", "--rm", image, "cat", "demo/generated/idp-ca.pem", capture_output=True)
+        if baked.stdout != ca_file.read_text(encoding="utf-8"):
+            raise RuntimeError("the demo image does not carry the chain the registrar wrote")
+        chain_count = baked.stdout.count("BEGIN CERTIFICATE")
+        print(f"the demo image carries the {chain_count}-certificate chain at /app/demo/generated/idp-ca.pem", flush=True)
         docker_rm(demo_name)
+        mounts = []
+        for name in ("sp.key", "sp.crt", "idp-metadata.xml"):
+            mounts += ["-v", f"{demo_dir / 'generated' / name}:/app/demo/generated/{name}:ro"]
         docker(
             "run", "-d", "--name", demo_name, "--network", "host",
-            "-v", f"{work}:/work",
+            *mounts,
             "-e", f"PORT={demo_port}",
             "-e", f"PUBLIC_URL={demo_origin}",
-            "-e", "SAML_CONFIG=/work/saml.json",
             image,
             "saml-demo", "--public-url", demo_origin,
         )
@@ -683,7 +717,7 @@ def main():
             ),
             "session-revoked to end the local session",
         )
-        print(json.dumps({"ok": True, "subject": signed_in.get("subject"), "events": finished.get("events")}, indent=2))
+        print(json.dumps({"ok": True, "subject": signed_in.get("subject"), "idpCaInImage": chain_count, "events": finished.get("events")}, indent=2))
     finally:
         if sys.exc_info()[0] is not None and demo_name:
             logs = subprocess.run(["docker", "logs", demo_name], check=False, text=True, capture_output=True)

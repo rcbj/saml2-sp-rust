@@ -1,2 +1,4 @@
 .git
 target
+demo/generated/*
+!demo/generated/idp-ca.pem
