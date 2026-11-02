@@ -1199,7 +1199,7 @@ dependencies = [
 
 [[package]]
 name = "saml2-sp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes",
  "aes-gcm",
