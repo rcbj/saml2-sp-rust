@@ -13,8 +13,10 @@ Request bindings are `redirect` and `post`. Response bindings are `post`, `redir
 ## Tests
 
 ```bash
-cargo test
+docker build --target test .
 ```
+
+The `test` stage runs `cargo test` in `rust:1`. GitHub Actions uses that command. Do not run Cargo on the host. The demo image does not run the suite.
 
 Signatures and decryption are real. The stub identity provider signs with this crate's exclusive canonicalization and is created inside the tests. No live iya-sts.
 
@@ -24,7 +26,7 @@ Crate `saml2-sp` (edition 2021), binaries `saml2-sp` and `demo`, `scripts/config
 
 ## Demo
 
-`cargo run --bin demo`. `GET /healthz` is `200` with body `ok`. Pages: sign-in, `/login` (redirect or POST form), `/saml/acs`, and logout, plus metadata. Loopback entityID and assertion-consumer URLs follow `PORT`. Other hosts stay as written. `PUBLIC_URL` or `--public-url` replaces the origin and keeps the path. The default `http://localhost:3000` is not an explicit public URL. `demo/saml.json` uses `file:` placeholders and omits `signals`. Do not commit `demo/generated/`.
+`docker compose up --build`. `GET /healthz` is `200` with body `ok`. Pages: sign-in, `/login` (redirect or POST form), `/saml/acs`, and logout, plus metadata. Loopback entityID and assertion-consumer URLs follow `PORT`. Other hosts stay as written. `PUBLIC_URL` or `--public-url` replaces the origin and keeps the path. The default `http://localhost:3000` is not an explicit public URL. `demo/saml.json` uses `file:` placeholders and omits `signals`. Do not commit `demo/generated/`.
 
 ## Signals
 
