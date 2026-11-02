@@ -18,6 +18,10 @@ const SESSION_MS: i64 = 8 * 60 * 60 * 1000;
 
 struct Held { login: SamlLogin, expires_ms: i64 }
 
+struct Seen { event_type: String, jti: String }
+
+const SESSION_REVOKED: &str = "https://schemas.openid.net/secevent/caep/event-type/session-revoked";
+
 struct App {
     port: u16,
     public_url: String,
@@ -30,6 +34,7 @@ struct App {
     receiver: Arc<Mutex<Option<SignalsReceiver>>>,
     receiver_state: Arc<Mutex<String>>,
     sessions: Arc<Mutex<HashMap<String, Held>>>,
+    events: Arc<Mutex<Vec<Seen>>>,
 }
 
 fn main() {
@@ -137,6 +142,7 @@ fn configure() -> Result<App, String> {
     Ok(App {
         port, public_url, public_given, config_path, secret, secure_cookies, ssf_transmitter, ssf_poll_ms,
         receiver: Arc::new(Mutex::new(None)), receiver_state: Arc::new(Mutex::new(receiver_state)), sessions: Arc::new(Mutex::new(HashMap::new())),
+        events: Arc::new(Mutex::new(Vec::new())),
     })
 }
 
@@ -232,6 +238,26 @@ fn start_receiver(app: &App, sp: &ServiceProvider) {
         Ok(built) => built,
         Err(error) => { *app.receiver_state.lock().expect("state") = format!("not running: {error}"); return; }
     };
+    let events = app.events.clone();
+    let sessions = app.sessions.clone();
+    let for_untrack = built.clone();
+    built.on("*", move |signal| {
+        events.lock().expect("events").push(Seen { event_type: signal.event_type.clone(), jti: signal.jti.clone() });
+        // The assertion SessionIndex often is the IdP session, and on_end_sessions already dropped it.
+        // When it is only the assertion id, this demo still has that one login.
+        if signal.event_type == SESSION_REVOKED {
+            let sid = {
+                let mut guard = sessions.lock().expect("sessions");
+                if guard.len() != 1 { return Ok(()); }
+                let sid = guard.keys().next().cloned().expect("session");
+                guard.remove(&sid);
+                sid
+            };
+            for_untrack.untrack(&sid);
+            println!("ssf: the assertion SessionIndex is not the CAEP session id; ended this demo's one session");
+        }
+        Ok(())
+    });
     *app.receiver.lock().expect("receiver") = Some(built.clone());
     let state = app.receiver_state.clone();
     let slot = app.receiver.clone();
@@ -256,6 +282,9 @@ fn route(app: &App, req: &Request) -> Response {
     if req.path == "/healthz" {
         return text(200, "text/plain", "ok");
     }
+    if req.path == "/live-status" && req.method == "GET" {
+        return live_status(app);
+    }
     match req.path.as_str() {
         "/styles.css" => return file_response("demo/public/styles.css", "text/css"),
         "/app.js" => return file_response("demo/public/app.js", "text/javascript"),
@@ -270,6 +299,27 @@ fn route(app: &App, req: &Request) -> Response {
         _ => {}
     }
     text(404, "text/plain", "not found")
+}
+
+fn live_status(app: &App) -> Response {
+    let now = now_ms();
+    let (signed_in, subject) = {
+        let sessions = app.sessions.lock().expect("sessions");
+        let mut signed_in = false;
+        let mut subject: Option<String> = None;
+        for held in sessions.values() {
+            if now > held.expires_ms { continue; }
+            signed_in = true;
+            if subject.is_none() && !held.login.name_id.is_empty() {
+                subject = Some(held.login.name_id.clone());
+            }
+        }
+        (signed_in, subject)
+    };
+    let receiver = app.receiver_state.lock().expect("state").clone();
+    let events: Vec<Value> = app.events.lock().expect("events").iter().map(|item| json!({"type": item.event_type, "jti": item.jti})).collect();
+    let body = json!({"signedIn": signed_in, "subject": subject, "receiver": receiver, "events": events});
+    text(200, "application/json", &body.to_string())
 }
 
 fn page(app: &App, req: &Request) -> Response {
