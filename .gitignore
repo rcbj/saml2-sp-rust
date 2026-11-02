@@ -1,6 +1,6 @@
 /target
 demo/generated/
-bin/
+/bin/
 *.exe
 *.test
 __pycache__/
