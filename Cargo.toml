@@ -1,6 +1,6 @@
 [package]
 name = "saml2-sp"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 authors = ["rcbjBlueMars <9321971+rcbjBlueMars@users.noreply.github.com>"]
