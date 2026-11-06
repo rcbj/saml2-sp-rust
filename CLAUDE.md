@@ -1,6 +1,6 @@
 # saml2-sp
 
-Rust service provider for SAML 2.0 Web Browser SSO, plus a Shared Signals poll receiver. Version 0.1.1. MIT. `develop` and `main` are one commit. A pull request merged into `main` publishes the crate to crates.io after the test workflow succeeds on that commit. A direct push does not. The token is the `CARGO_REGISTRY_TOKEN` repository secret. A version already on crates.io stays there; the next release is a new `version` in `Cargo.toml`.
+Rust service provider for SAML 2.0 Web Browser SSO, plus a Shared Signals poll receiver. Version 0.1.2. MIT. `develop` and `main` are one commit. A pull request merged into `main` publishes the crate to crates.io after the test workflow succeeds on that commit. A direct push does not. The token is the `CARGO_REGISTRY_TOKEN` repository secret. A version already on crates.io stays there; the next release is a new `version` in `Cargo.toml`.
 
 ## Usage
 
