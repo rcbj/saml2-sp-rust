@@ -7,7 +7,7 @@ use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes128Gcm, Aes256Gcm, AesGcm, KeyInit};
 
 type Aes192Gcm = AesGcm<Aes192, U12>;
-use cipher::{BlockDecryptMut, KeyIvInit};
+use cipher::{BlockModeDecrypt, KeyIvInit};
 use rsa::oaep::Oaep;
 use rsa::RsaPrivateKey;
 use sha1::Sha1;
@@ -123,12 +123,12 @@ pub(crate) fn decrypt_element(encrypted: &Elem, key: &RsaPrivateKey) -> Result<S
         if blob.len() < 12 + 16 {
             return Err(decrypt_fail("the ciphertext is too short"));
         }
-        let nonce = aes_gcm::Nonce::from_slice(&blob[..12]);
+        let nonce = aes_gcm::Nonce::<U12>::try_from(&blob[..12]).map_err(|_| decrypt_fail("the content could not be decrypted"))?;
         let ct = &blob[12..];
         let plain = match spec.key_len {
-            16 => Aes128Gcm::new_from_slice(&content_key).ok().and_then(|c| c.decrypt(nonce, Payload { msg: ct, aad: b"" }).ok()),
-            24 => Aes192Gcm::new_from_slice(&content_key).ok().and_then(|c| c.decrypt(nonce, Payload { msg: ct, aad: b"" }).ok()),
-            _ => Aes256Gcm::new_from_slice(&content_key).ok().and_then(|c| c.decrypt(nonce, Payload { msg: ct, aad: b"" }).ok()),
+            16 => Aes128Gcm::new_from_slice(&content_key).ok().and_then(|c| c.decrypt(&nonce, Payload { msg: ct, aad: b"" }).ok()),
+            24 => Aes192Gcm::new_from_slice(&content_key).ok().and_then(|c| c.decrypt(&nonce, Payload { msg: ct, aad: b"" }).ok()),
+            _ => Aes256Gcm::new_from_slice(&content_key).ok().and_then(|c| c.decrypt(&nonce, Payload { msg: ct, aad: b"" }).ok()),
         };
         let plain = plain.ok_or_else(|| decrypt_fail("the content could not be decrypted"))?;
         return String::from_utf8(plain).map_err(|_| decrypt_fail("the content could not be decrypted"));
@@ -138,9 +138,9 @@ pub(crate) fn decrypt_element(encrypted: &Elem, key: &RsaPrivateKey) -> Result<S
     }
     let mut plain = blob[16..].to_vec();
     let opened = match spec.key_len {
-        16 => cbc::Decryptor::<aes::Aes128>::new_from_slices(&content_key, &blob[..16]).ok().and_then(|d| d.decrypt_padded_mut::<cipher::block_padding::NoPadding>(&mut plain).ok()),
-        24 => cbc::Decryptor::<aes::Aes192>::new_from_slices(&content_key, &blob[..16]).ok().and_then(|d| d.decrypt_padded_mut::<cipher::block_padding::NoPadding>(&mut plain).ok()),
-        _ => cbc::Decryptor::<aes::Aes256>::new_from_slices(&content_key, &blob[..16]).ok().and_then(|d| d.decrypt_padded_mut::<cipher::block_padding::NoPadding>(&mut plain).ok()),
+        16 => cbc::Decryptor::<aes::Aes128>::new_from_slices(&content_key, &blob[..16]).ok().and_then(|d| d.decrypt_padded::<cipher::block_padding::NoPadding>(&mut plain).ok()),
+        24 => cbc::Decryptor::<aes::Aes192>::new_from_slices(&content_key, &blob[..16]).ok().and_then(|d| d.decrypt_padded::<cipher::block_padding::NoPadding>(&mut plain).ok()),
+        _ => cbc::Decryptor::<aes::Aes256>::new_from_slices(&content_key, &blob[..16]).ok().and_then(|d| d.decrypt_padded::<cipher::block_padding::NoPadding>(&mut plain).ok()),
     };
     let plain = opened.ok_or_else(|| decrypt_fail("the content could not be decrypted"))?;
     if plain.is_empty() {

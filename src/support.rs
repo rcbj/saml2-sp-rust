@@ -196,7 +196,7 @@ pub fn encrypt_assertion(assertion: &str, cipher_name: &str, transport: &str, wr
         let mut iv = [0u8; 12];
         OsRng.fill_bytes(&mut iv);
         let cipher = Aes256Gcm::new_from_slice(&content_key).expect("gcm");
-        let sealed = cipher.encrypt(Nonce::from_slice(&iv), assertion.as_bytes()).expect("seal");
+        let sealed = cipher.encrypt(&Nonce::from(iv), assertion.as_bytes()).expect("seal");
         let mut blob = iv.to_vec();
         blob.extend(sealed);
         (blob, "http://www.w3.org/2009/xmlenc11#aes256-gcm")
@@ -205,9 +205,9 @@ pub fn encrypt_assertion(assertion: &str, cipher_name: &str, transport: &str, wr
         OsRng.fill_bytes(&mut iv);
         let mut buf = vec![0u8; assertion.len() + 16];
         buf[..assertion.len()].copy_from_slice(assertion.as_bytes());
-        use cipher::{BlockEncryptMut, KeyIvInit};
+        use cipher::{BlockModeEncrypt, KeyIvInit};
         let enc = cbc::Encryptor::<aes::Aes128>::new_from_slices(&content_key, &iv).expect("cbc");
-        let sealed = enc.encrypt_padded_mut::<cipher::block_padding::Pkcs7>(&mut buf, assertion.len()).expect("pad").to_vec();
+        let sealed = enc.encrypt_padded::<cipher::block_padding::Pkcs7>(&mut buf, assertion.len()).expect("pad").to_vec();
         let mut blob = iv.to_vec();
         blob.extend(sealed);
         (blob, "http://www.w3.org/2001/04/xmlenc#aes128-cbc")
