@@ -23,7 +23,7 @@ flate2 = "1"
 hmac = "0.12"
 libc = "0.2"
 native-tls = "0.2"
-p256 = { version = "0.13", features = ["ecdsa"] }
+p256 = { version = "0.14", features = ["ecdsa"] }
 p384 = { version = "0.14", features = ["ecdsa"] }
 rand = "0.8"
 rcgen = "0.14"
