@@ -367,15 +367,18 @@ fn the_receiver_asks_for_the_policy_event_and_hands_it_to_the_pep() {
     assert_eq!(pdp.count("/access/v1/evaluation"), 2, "the event cleared the cache");
 }
 
-/// The last heartbeat's `policyEvents` after `before` heartbeats were seen.
-fn next_policy_events(pdp: &Pdp, before: usize) -> Value {
+/// Waits up to 10 s for a heartbeat whose `policyEvents` is `want` (one
+/// built before the receiver started can still be on its way).
+fn assert_policy_events(pdp: &Pdp, want: &str) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while pdp.count("/xacml/pep/heartbeat") <= before && std::time::Instant::now() < deadline {
+    loop {
+        let last = pdp.bodies("/xacml/pep/heartbeat").last().map(|beat| beat["policyEvents"].clone());
+        if last.as_ref().is_some_and(|value| value == want) {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "no heartbeat said {want}; the last said {last:?}");
         std::thread::sleep(Duration::from_millis(100));
     }
-    let beats = pdp.bodies("/xacml/pep/heartbeat");
-    assert!(beats.len() > before, "no heartbeat came");
-    beats.last().unwrap()["policyEvents"].clone()
 }
 
 struct Errors(Mutex<Vec<String>>);
@@ -414,7 +417,6 @@ fn a_reused_stream_gets_the_policy_event_added() {
     let tx = start_transmitter(false);
     tx.add_stream(old(&tx, "old"));
     let receiver = SignalsReceiver::new(options(&tx, sp.pep().cloned())).unwrap();
-    let before = pdp.count("/xacml/pep/heartbeat");
     receiver.start().unwrap();
     receiver.stop();
     assert_eq!(tx.created(), 0, "the stream was reused, not made again");
@@ -428,7 +430,7 @@ fn a_reused_stream_gets_the_policy_event_added() {
     assert!(stream["events_delivered"].as_array().unwrap().iter().any(|e| e == POLICIES_CHANGED_EVENT));
     assert_eq!(stream["delivery"]["endpoint_url"], format!("{}/ssf/poll/old", tx.url), "the delivery the listing gave is kept");
     assert!(errors.0.lock().unwrap().is_empty(), "{:?}", errors.0.lock().unwrap());
-    assert_eq!(next_policy_events(&pdp, before), "requested");
+    assert_policy_events(&pdp, "requested");
 
     // Nothing missing: no PATCH.
     let again = SignalsReceiver::new(options(&tx, sp.pep().cloned())).unwrap();
@@ -446,7 +448,7 @@ fn a_reused_stream_gets_the_policy_event_added() {
     refused.stop();
     assert_eq!(tx.patches().len(), 1);
     assert!(errors.0.lock().unwrap().iter().any(|l| l.contains("answered 405")), "{:?}", errors.0.lock().unwrap());
-    assert_eq!(next_policy_events(&pdp, pdp.count("/xacml/pep/heartbeat")), "excluded");
+    assert_policy_events(&pdp, "excluded");
 }
 
 struct Quiet;
