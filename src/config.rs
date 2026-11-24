@@ -27,6 +27,10 @@ pub struct Config {
     pub idp_ca: String,
     pub idp_entity_id: String,
     pub name_id_format: String,
+    /// The `pep` section with this library's defaults filled in (the `pep`
+    /// feature), for `ServiceProvider` to build the embedded PEP from.
+    #[cfg(feature = "pep")]
+    pub(crate) pep: Option<Map<String, Value>>,
     pub(crate) private_key: RsaPrivateKey,
     pub(crate) certificate_der: Vec<u8>,
 }
@@ -53,7 +57,7 @@ impl Config {
     }
 }
 
-fn expand(value: &str) -> Result<String, SamlError> {
+pub(crate) fn expand(value: &str) -> Result<String, SamlError> {
     let mut value = value.to_string();
     let mut seen = 0;
     loop {
@@ -209,6 +213,12 @@ pub fn resolve_config(config: &Map<String, Value>, base_dir: &str) -> Result<Con
     let want_assertions_signed = config.get("wantAssertionsSigned").map(|v| if v.is_null() { true } else { bool_or(v, true) }).unwrap_or(true);
     let want_assertions_encrypted = config.get("wantAssertionsEncrypted").map(|v| if v.is_null() { false } else { bool_or(v, false) }).unwrap_or(false);
     let allow_unsolicited = config.get("allowUnsolicited").map(|v| if v.is_null() { false } else { bool_or(v, false) }).unwrap_or(false);
+    #[cfg(feature = "pep")]
+    let pep = crate::pep::section(config, &base, &idp_ca)?;
+    #[cfg(not(feature = "pep"))]
+    if config.get("pep").is_some_and(|v| !v.is_null()) {
+        return Err(err("config", "pep is configured, and this build has no embedded PEP (the saml2-sp `pep` feature)"));
+    }
     let private_key_pem = private_pem(&private_key);
     Ok(Config {
         entity_id,
@@ -226,6 +236,8 @@ pub fn resolve_config(config: &Map<String, Value>, base_dir: &str) -> Result<Con
         idp_ca,
         idp_entity_id,
         name_id_format,
+        #[cfg(feature = "pep")]
+        pep,
         private_key,
         certificate_der,
     })

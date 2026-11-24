@@ -226,6 +226,9 @@ fn start_receiver(app: &App, sp: &ServiceProvider) {
         tls: Some(tls),
         description: format!("saml2-sp demo ({entity})"),
         poll_interval_ms: app.ssf_poll_ms,
+        // The embedded PEP's policy events ride this stream (the `pep` feature).
+        #[cfg(feature = "pep")]
+        pep: sp.pep().cloned(),
         on_end_sessions: Some(Arc::new(move |ids, _| {
             let mut guard = sessions.lock().expect("sessions");
             for id in ids { guard.remove(id); }
@@ -298,7 +301,37 @@ fn route(app: &App, req: &Request) -> Response {
         "/" if req.method == "GET" => return page(app, req),
         _ => {}
     }
+    #[cfg(feature = "pep")]
+    if let Some(id) = req.path.strip_prefix("/orders/").filter(|id| !id.is_empty() && !id.contains('/')) {
+        return order(app, req, id);
+    }
     text(404, "text/plain", "not found")
+}
+
+/// A route the embedded PEP protects (the `pep` feature, iya-sts#1206): the
+/// signed-in person's access to one order, decided by the `pep` section's
+/// PEP from the validated assertion. A GET is `read` and anything else
+/// `write`. No sign-in is 401, a Deny 403, and a decision that couldn't be
+/// made 503: never served.
+#[cfg(feature = "pep")]
+fn order(app: &App, req: &Request, id: &str) -> Response {
+    use saml2_sp::pep::{Access, Decision};
+    let Some(held) = current_session(app, req) else {
+        return page_html("Sign in", "<h1>Sign in first</h1><p><a href=\"/login\">Sign in</a></p>", 401);
+    };
+    let sp = match provider(app) {
+        Ok(sp) => sp,
+        Err(error) => return page_html("Unavailable", &format!("<h1>The service provider is not configured</h1><p class=\"problem\">{}</p>", escape(&error)), 503),
+    };
+    let action = if req.method == "GET" { "read" } else { "write" };
+    match sp.decide(&held.login, &Access::new(action, "order", id)) {
+        Decision::Permit { obligations, .. } => {
+            let note = if obligations.is_empty() { String::new() } else { format!("<p><small>{} obligation(s) to discharge.</small></p>", obligations.len()) };
+            page_html("Order", &format!("<h1>Order {}</h1><p>The PEP permitted <code>{action}</code>.</p>{note}", escape(id)), 200)
+        }
+        Decision::Deny { why } => page_html("Forbidden", &format!("<h1>Not allowed</h1><p>The PEP denied <code>{action}</code> on order {}: {}</p>", escape(id), escape(&why)), 403),
+        Decision::Unavailable { why } => page_html("Unavailable", &format!("<h1>No decision</h1><p>The PEP could not decide: {}</p>", escape(&why)), 503),
+    }
 }
 
 fn live_status(app: &App) -> Response {
@@ -494,7 +527,7 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
 }
 
 fn write_response(stream: &mut TcpStream, response: &Response) -> std::io::Result<()> {
-    let reason = match response.status { 200 => "OK", 302 => "Found", 303 => "See Other", 400 => "Bad Request", 404 => "Not Found", 500 => "Internal Server Error", _ => "OK" };
+    let reason = match response.status { 200 => "OK", 302 => "Found", 303 => "See Other", 400 => "Bad Request", 401 => "Unauthorized", 403 => "Forbidden", 404 => "Not Found", 500 => "Internal Server Error", 503 => "Service Unavailable", _ => "OK" };
     let mut head = format!("HTTP/1.1 {} {reason}\r\n", response.status);
     let mut saw_length = false;
     for (name, value) in &response.headers {

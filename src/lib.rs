@@ -15,6 +15,8 @@ mod http;
 mod jws;
 mod keys;
 mod metadata;
+#[cfg(feature = "pep")]
+pub mod pep;
 mod provider;
 mod receiver;
 mod replay;
@@ -48,3 +50,5 @@ mod plain_http_test;
 mod configure_test;
 #[cfg(test)]
 mod trust_chain_test;
+#[cfg(all(test, feature = "pep"))]
+mod pep_test;

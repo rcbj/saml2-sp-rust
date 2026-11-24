@@ -400,3 +400,14 @@ fn parse_xml_helper_stays_available() {
 }
 
 
+
+#[cfg(not(feature = "pep"))]
+#[test]
+fn a_pep_section_is_refused_without_the_pep_feature() {
+    let mut extra = serde_json::Map::new();
+    extra.insert("pep".into(), json!({"name": "pep-demo", "assertionKey": "/k.pem"}));
+    rejects(ServiceProvider::create(&test_config(extra, ""), "", None).map(|_| ()), "config", "the saml2-sp `pep` feature");
+    let mut extra = serde_json::Map::new();
+    extra.insert("pep".into(), serde_json::Value::Null);
+    assert!(ServiceProvider::create(&test_config(extra, ""), "", None).is_ok(), "a null section is no section");
+}

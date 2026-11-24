@@ -250,7 +250,14 @@ pub fn artifact_for(entity: &str) -> String {
     b64_standard(&out)
 }
 
-pub struct HttpRequest { pub method: String, pub path: String, pub body: Vec<u8> }
+pub struct HttpRequest {
+    pub method: String,
+    pub path: String,
+    pub body: Vec<u8>,
+    /// Lower-cased names. The stub PDP (`pep_test.rs`) reads `authorization`.
+    #[cfg_attr(not(feature = "pep"), allow(dead_code))]
+    pub headers: HashMap<String, String>,
+}
 
 pub struct TestServer {
     pub url: String,
@@ -297,9 +304,13 @@ fn read_http(stream: &mut TcpStream) -> Option<HttpRequest> {
     let header = String::from_utf8_lossy(&buf[..header_end]).to_string();
     let mut body = buf[header_end + 4..].to_vec();
     let mut length = 0usize;
+    let mut headers = HashMap::new();
     for line in header.lines() {
         if let Some(rest) = line.to_ascii_lowercase().strip_prefix("content-length:") {
             length = rest.trim().parse().unwrap_or(0);
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
         }
     }
     while body.len() < length {
@@ -311,7 +322,7 @@ fn read_http(stream: &mut TcpStream) -> Option<HttpRequest> {
     let mut parts = header.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
     let path = parts.next().unwrap_or("/").split('?').next().unwrap_or("/").to_string();
-    Some(HttpRequest { method, path, body })
+    Some(HttpRequest { method, path, body, headers })
 }
 
 fn write_http(stream: &mut TcpStream, status: u16, ctype: &str, body: &[u8]) -> std::io::Result<()> {

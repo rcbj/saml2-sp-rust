@@ -42,14 +42,14 @@ struct TxState {
     held_once: bool,
 }
 
-struct Transmitter {
+pub(crate) struct Transmitter {
     server: TestServer,
-    url: String,
+    pub(crate) url: String,
     state: Arc<Mutex<TxState>>,
 }
 
 impl Transmitter {
-    fn put_set(&self, event_type: &str, sub_id: Value, extra: Map<String, Value>, key: Option<&rsa::RsaPrivateKey>, aud: &str, iss: &str) -> String {
+    pub(crate) fn put_set(&self, event_type: &str, sub_id: Value, extra: Map<String, Value>, key: Option<&rsa::RsaPrivateKey>, aud: &str, iss: &str) -> String {
         let key = key.unwrap_or(tx_key());
         let aud = if aud.is_empty() { "my-app" } else { aud };
         let iss = if iss.is_empty() { self.url.as_str() } else { iss };
@@ -73,7 +73,7 @@ impl Transmitter {
 
 fn new_jti() -> String { crate::artifact::new_id().trim_start_matches('_').to_string() }
 
-fn start_transmitter(hold: bool) -> Transmitter {
+pub(crate) fn start_transmitter(hold: bool) -> Transmitter {
     let state = Arc::new(Mutex::new(TxState {
         queue: HashMap::new(), acked: Vec::new(), errs: Map::new(), streams: Vec::new(), created: 0,
         hold: if hold { Some(Arc::new((Mutex::new(true), std::sync::Condvar::new()))) } else { None },

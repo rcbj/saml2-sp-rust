@@ -61,6 +61,11 @@ pub struct ReceiverOptions {
     pub poll_interval_ms: u64,
     pub max_events: u64,
     pub log: Option<Arc<dyn Logger>>,
+    /// The service provider's embedded PEP (`ServiceProvider::pep`). When it
+    /// wants policy events, the stream asks for `pep-policies-changed` and
+    /// each verified one is handed to it.
+    #[cfg(feature = "pep")]
+    pub pep: Option<Arc<crate::pep::Pep>>,
 }
 
 impl Default for ReceiverOptions {
@@ -78,6 +83,8 @@ impl Default for ReceiverOptions {
             poll_interval_ms: 0,
             max_events: 0,
             log: None,
+            #[cfg(feature = "pep")]
+            pep: None,
         }
     }
 }
@@ -157,7 +164,25 @@ impl SignalsReceiver {
         }
         let interval = if opt.poll_interval_ms == 0 { 5000 } else { opt.poll_interval_ms };
         let max_events = if opt.max_events == 0 { 50 } else { opt.max_events };
-        let requested = opt.events_requested.unwrap_or_else(default_events_requested);
+        #[allow(unused_mut)]
+        let mut requested = opt.events_requested.unwrap_or_else(default_events_requested);
+        #[allow(unused_mut)]
+        let mut handlers: HashMap<String, Vec<Handler>> = HashMap::new();
+        // The embedded PEP's policy events ride this stream (iya-sts#1206 D4).
+        #[cfg(feature = "pep")]
+        if let Some(pep) = opt.pep.filter(|pep| crate::pep::wants_events(pep)) {
+            if !requested.iter().any(|e| e == crate::pep::POLICIES_CHANGED_EVENT) {
+                requested.push(crate::pep::POLICIES_CHANGED_EVENT.to_string());
+            }
+            // `handle` verified the SET before any handler sees it. The payload
+            // is the event's body under its type; the PEP treats it as a hint
+            // and pulls with its own token.
+            let handler: Handler = Arc::new(move |signal: &SignalEvent| {
+                pep.on_policy_event(&Value::Object(signal.payload.clone()));
+                Ok(())
+            });
+            handlers.insert(crate::pep::POLICIES_CHANGED_EVENT.to_string(), vec![handler]);
+        }
         let ending = opt.end_on.unwrap_or_else(default_ending_events);
         let mut end_on = HashMap::new();
         for item in ending {
@@ -186,7 +211,7 @@ impl SignalsReceiver {
                     keys_at: None,
                     ack: Vec::new(),
                     errs: Map::new(),
-                    handlers: HashMap::new(),
+                    handlers,
                 }),
                 sched: Mutex::new(Sched { running: false, generation: 0, inflight: None }),
                 gate: Gate::new(),
@@ -200,6 +225,16 @@ impl SignalsReceiver {
 
     pub fn untrack(&self, local_id: &str) {
         self.inner.index.remove(local_id);
+    }
+
+    /// The index of tracked local sessions (`ServiceProvider::decide_session`).
+    pub fn session_index(&self) -> Arc<MemorySessionIndex> {
+        self.inner.index.clone()
+    }
+
+    /// The event types this receiver asks its stream for.
+    pub fn events_requested(&self) -> &[String] {
+        &self.inner.events_requested
     }
 
     pub fn on<F>(&self, event_type: &str, handler: F) -> &Self

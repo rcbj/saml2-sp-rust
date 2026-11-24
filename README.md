@@ -43,6 +43,36 @@ receiver.stop();
 
 The receiver discovers the transmitter, keeps one poll stream (`urn:ietf:rfc:8936`), and verifies each Security Event Token against the published JWKS. `stop` waits until a poll already running has finished. By default a session ends on `session-revoked`, `account-disabled`, `account-purged`, `credential-compromise`, and `sessions-revoked`.
 
+## Embedded PEP (features `pep` and `local`)
+
+The [iya-pep](https://github.com/rcbj/iya-pep-rust) crate, wired in (iya-sts [#1206](https://github.com/rcbj/iya-sts/issues/1206)): an application asks iya-sts's policy whether a signed-in person may act on a resource.
+
+```toml
+saml2-sp = { version = "…", features = ["pep"] }    # central: AuthZEN at iya-sts
+saml2-sp = { version = "…", features = ["local"] }  # local too: decided in process
+```
+
+Add a `pep` section to the configuration. It is off unless present, and a build without the `pep` feature refuses it rather than ignoring it:
+
+```json
+"pep": { "name": "pep-orders", "mode": "local", "assertionKey": "generated/pep-key.pem" }
+```
+
+- **Defaults from this library:**
+  - `pdpUrl` is the identity provider's entityID. iya-sts's SAML entityID is the realm's issuer, so this is the service's URL with the realm prefix. Name `pdpUrl` for an identity provider whose entityID is not iya-sts's URL.
+  - `application` is `entityId`, the identifier iya-sts registers this service provider under.
+  - `tlsCa` is `idpCa`.
+  - `signals` is on when this library's receiver runs: an `ssf` block, and `signals` not `false`.
+  - A relative `assertionKey` is read from the configuration's directory, like `privateKey`.
+  - iya-pep's README lists every member.
+- **The PEP's key is its own.** `ServiceProvider::create` refuses a configuration where the assertion key is `privateKey` (the key that signs requests, decrypts assertions and authenticates the receiver), compared by JWK thumbprint. Certify the key and bind the PEP to the application with iya-sts's `issue-pep-credential`.
+- **Deciding:**
+  - `sp.decide(&login, &Access::new("read", "order", "42"))` for a validated `SamlLogin`, or `sp.decide_session(&receiver.session_index(), local_id, &login, …)`. A session that is no longer tracked (signed out, expired, or ended by CAEP `session-revoked` or another ending event) is a Deny, and nothing is asked.
+  - The subject's id is the username: the first of `urn:oid:0.9.2342.19200300.100.1.1`, `uid` and `http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name` the assertion carries (iya-sts sends all three), else the NameID. A transient NameID names nobody the PIP can resolve. The properties are the attributes (by Name, and by FriendlyName), `AuthnContextClassRef` as `acr`, an `amr` attribute as `amr`, and `AuthnInstant` as `auth_time` in epoch seconds. Only the claims the realm's AuthZEN catalogue declares are sent. No request header is read.
+  - The answer is `Permit { obligations, advice }`, `Deny` or `Unavailable`. `Unavailable` means no policy is held yet, the service can't be reached, or there is no `pep` section. It is never a Permit.
+- **Signals.** A `SignalsReceiver` given the PEP (`ReceiverOptions { pep: sp.pep().cloned(), .. }`) asks its stream for `urn:iya:sts:secevent:event-type:pep-policies-changed`: always in `local` mode, and in `central` when `permitCacheMs` is set. It verifies the SET like any other and hands the event to the PEP, which pulls with its own token. Without a receiver, a `local` PEP polls at `pollIntervalMs`.
+- **The demo** protects `GET /orders/<id>` with the PEP when the image is built with `local` (the Dockerfile does) and `demo/saml.json` has a `pep` section.
+
 ## Tests
 
 ```bash

@@ -16,11 +16,22 @@ Request bindings are `redirect` and `post`. Response bindings are `post`, `redir
 docker build --target test .
 ```
 
-The `test` stage runs `cargo test` in `rust:1`. GitHub Actions uses that command. Do not run Cargo on the host. The demo image does not run the suite.
+The `test` stage runs `cargo test`, then `cargo test --all-features` (the embedded PEP), in `rust:1`. GitHub Actions uses that command. Do not run Cargo on the host. The demo image does not run the suite.
 
 Signatures and decryption are real. The stub identity provider signs with this crate's exclusive canonicalization and is created inside the tests.
 
 `python3 scripts/live_iya_sts.py` signs the demo in to a fresh iya-sts (main, memory mode, no persistence, no clustering) and checks credential-change and session-revoked on `GET /live-status`. `IYA_STS_URL` uses a running iya-sts; `IYA_STS_IMAGE` starts one from an image; otherwise it clones and builds main. The registrar runs inside the demo image, never with Cargo on the host. Default ports 18518 (iya-sts) and 18618 (demo), `LIVE_STS_PORT` / `LIVE_DEMO_PORT`; it refuses 3000, 8081, and 18481 to 18495. Always a fresh iya-sts: a second registration of the same SP fails. Its order is install script, then demo image build, then run: it copies the checkout (no `demo/generated`, `.git`, `target`) to a scratch context, builds the image there once, runs the registrar in it (which writes the chain), builds again (only the `demo/` layer changes), checks the image's `demo/generated/idp-ca.pem` equals the saved file, and runs the demo with `sp.key`, `sp.crt` and `idp-metadata.xml` mounted file by file. It never fetches the CA for the demo, rewrites `idpCa`, or mounts a CA; it reads the saved chain only for its own HTTPS client. No script prints a password or secret, or a URL (trace lines carry fixed labels). Secrets reach `docker run` as `-e NAME`, the value in the child's environment. A generated test-user password goes to `demo/generated/<user>.password` (created 0600) and only that path is printed. Every `ssl` context in `scripts/` sets TLS 1.2 as the minimum. `.github/workflows/nightly.yml` runs the unit suite and that script at 07:10 UTC (`10 7 * * *`) and on `workflow_dispatch`. Push CI stays the unit suite.
+
+## Embedded PEP
+
+The embedded PEP (#40, iya-sts#1206 work item 8), behind the `pep` feature (`local` adds the engine), as `oidc-caep-risc` did in its #46: `src/pep.rs` wires in the shared `iya-pep` crate (rcbj/iya-pep-rust).
+- `resolve_config` reads the `pep` section (`pep::section`): `signals` defaults to whether the receiver runs (an `ssf` block and not `signals: false`), `tlsCa` to `idpCa`, and a relative `assertionKey` is joined to the configuration's directory. Without the feature, a `pep` section is refused rather than ignored.
+- `ServiceProvider::create`/`from_file` build and start it once the metadata is read: `pdpUrl` defaults to the identity provider's entityID (iya-sts's is the realm issuer, #523, realm prefix included) and `application` to `entityId`. It refuses an assertion key that is `privateKey` (the only key this library holds: signing, decryption, receiver TLS) by JWK thumbprint.
+- `decide` / `decide_session` adapt a `SamlLogin` (`pep::subject_of`): the id is the `uid` OID, `uid`, or the AD FS `name` claim, else the NameID; attributes, `acr`, `amr`, `auth_time` as properties. `decide_session` takes the receiver's `MemorySessionIndex` (`SignalsReceiver::session_index`); an untracked or expired session is a Deny.
+- `ReceiverOptions::pep`: `SignalsReceiver::new` adds `pep-policies-changed` to `events_requested` and registers the hand-over when the PEP wants events (`local`, or `central` with a Permit cache).
+- `src/pep_test.rs` has its own stub PDP (on `support::serve`, which now records headers) and reuses `ssf_test.rs`'s transmitter. The no-feature refusal is in `sp_test.rs`. The `test` stage runs `cargo test` and then `cargo test --all-features`; the demo image builds with `--features local`.
+- **The dependency is a git dependency on iya-pep-rust's `feature/1`** until that crate's first release. Switch it to the crates.io version then, because crates.io refuses a git dependency at publish.
+- The live test of the PEP waits for iya-sts #2026–#2028.
 
 ## Layout
 
@@ -28,7 +39,7 @@ Crate `saml2-sp` (edition 2021), binaries `saml2-sp` and `demo`, `scripts/config
 
 ## Demo
 
-`docker compose up --build`. `GET /healthz` is `200` with body `ok`. Pages: sign-in, `/login` (redirect or POST form), `/saml/acs`, and logout, plus metadata. `GET /live-status` is JSON `{signedIn, subject, receiver, events: [{type, jti}]}`, never an assertion. When `session-revoked` matched no tracked session (the assertion SessionIndex was the assertion id), the demo ends its one local session and untracks it; that is demo code, not the library. Loopback entityID and assertion-consumer URLs follow `PORT`. Other hosts stay as written. `PUBLIC_URL` or `--public-url` replaces the origin and keeps the path. The default `http://localhost:3000` is not an explicit public URL. `demo/saml.json` uses `file:` placeholders and omits `signals`. Do not commit `demo/generated/`.
+`docker compose up --build`. `GET /healthz` is `200` with body `ok`. Pages: sign-in, `/login` (redirect or POST form), `/saml/acs`, and logout, plus metadata. Built with `pep` (the image uses `local`), `/orders/<id>` is decided by the PEP: 401 without a sign-in, 403 on a Deny, 503 when no decision could be made. `GET /live-status` is JSON `{signedIn, subject, receiver, events: [{type, jti}]}`, never an assertion. When `session-revoked` matched no tracked session (the assertion SessionIndex was the assertion id), the demo ends its one local session and untracks it; that is demo code, not the library. Loopback entityID and assertion-consumer URLs follow `PORT`. Other hosts stay as written. `PUBLIC_URL` or `--public-url` replaces the origin and keeps the path. The default `http://localhost:3000` is not an explicit public URL. `demo/saml.json` uses `file:` placeholders and omits `signals`. Do not commit `demo/generated/`.
 
 ## Signals
 
