@@ -37,6 +37,9 @@ struct TxState {
     errs: Map<String, Value>,
     streams: Vec<Value>,
     created: i32,
+    /// Every PATCH body, and whether PATCH is refused (405).
+    patches: Vec<Value>,
+    refuse_patch: bool,
     hold: Option<Arc<(Mutex<bool>, std::sync::Condvar)>>,
     entered: Arc<(Mutex<bool>, std::sync::Condvar)>,
     held_once: bool,
@@ -49,6 +52,23 @@ pub(crate) struct Transmitter {
 }
 
 impl Transmitter {
+    /// A poll stream that already exists: GET lists it, PATCH merges into it.
+    pub(crate) fn add_stream(&self, stream: Value) {
+        self.state.lock().unwrap().streams.push(stream);
+    }
+
+    pub(crate) fn created(&self) -> i32 {
+        self.state.lock().unwrap().created
+    }
+
+    pub(crate) fn patches(&self) -> Vec<Value> {
+        self.state.lock().unwrap().patches.clone()
+    }
+
+    pub(crate) fn refuse_patch(&self) {
+        self.state.lock().unwrap().refuse_patch = true;
+    }
+
     pub(crate) fn put_set(&self, event_type: &str, sub_id: Value, extra: Map<String, Value>, key: Option<&rsa::RsaPrivateKey>, aud: &str, iss: &str) -> String {
         let key = key.unwrap_or(tx_key());
         let aud = if aud.is_empty() { "my-app" } else { aud };
@@ -76,6 +96,7 @@ fn new_jti() -> String { crate::artifact::new_id().trim_start_matches('_').to_st
 pub(crate) fn start_transmitter(hold: bool) -> Transmitter {
     let state = Arc::new(Mutex::new(TxState {
         queue: HashMap::new(), acked: Vec::new(), errs: Map::new(), streams: Vec::new(), created: 0,
+        patches: Vec::new(), refuse_patch: false,
         hold: if hold { Some(Arc::new((Mutex::new(true), std::sync::Condvar::new()))) } else { None },
         entered: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
         held_once: false,
@@ -100,6 +121,24 @@ pub(crate) fn start_transmitter(hold: bool) -> Transmitter {
         if req.path == "/ssf/stream" && req.method == "GET" {
             let streams = shared.lock().unwrap().streams.clone();
             return write(200, Value::Array(streams));
+        }
+        if req.path == "/ssf/stream" && req.method == "PATCH" {
+            let mut guard = shared.lock().unwrap();
+            guard.patches.push(body.clone());
+            if guard.refuse_patch {
+                return write(405, json!({"err": "method_not_allowed"}));
+            }
+            let Some(stream) = guard.streams.iter_mut().find(|s| s["stream_id"] == body["stream_id"]) else {
+                return write(404, json!({"err": "not found"}));
+            };
+            if let Some(events) = body.get("events_requested") {
+                stream["events_requested"] = events.clone();
+                stream["events_delivered"] = events.clone();
+            }
+            // An answer without delivery: the receiver keeps the one it listed.
+            let mut answer = stream.clone();
+            answer.as_object_mut().unwrap().remove("delivery");
+            return write(200, answer);
         }
         if req.path == "/ssf/stream" && req.method == "POST" {
             let mut guard = shared.lock().unwrap();

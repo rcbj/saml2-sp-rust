@@ -193,6 +193,27 @@ fn a_pep_section_builds_a_started_pep_with_the_librarys_defaults() {
     assert!(create(json!({"pep": null})).unwrap().pep().is_none());
 }
 
+/// `from_file` reads the `pep` section as `create` does, and the PEP it
+/// builds is started: the live run of oidc-caep-risc (its #46) found that
+/// library's file reader dropped the section, so this one is held to it too.
+#[test]
+fn from_file_keeps_the_pep_section() {
+    let pdp = start_pdp();
+    let dir = std::env::temp_dir().join(format!("saml2-sp-pep-from-file-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("pep-key.pem"), ec_pem()).unwrap();
+    let doc = test_config(extra(json!({"pep": {"name": "pep-demo", "assertionKey": "file:pep-key.pem", "pdpUrl": pdp.url, "heartbeatIntervalMs": 60000}})), "");
+    let path = dir.join("saml.json");
+    std::fs::write(&path, Value::Object(doc).to_string()).unwrap();
+    let sp = ServiceProvider::from_file(&path.to_string_lossy(), None, None).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let pep = sp.pep().expect("the configuration file's pep section built a PEP");
+    assert_eq!(pep.config().name, "pep-demo");
+    assert_eq!(pep.config().assertion_key, dir.join("pep-key.pem").to_string_lossy(), "relative to the file's directory");
+    assert!(pep.status().running);
+    assert!(pdp.count("/xacml/pep/register") >= 1, "and started it");
+}
+
 #[test]
 fn a_bad_section_is_refused_at_create() {
     let pdp = start_pdp();
@@ -344,6 +365,88 @@ fn the_receiver_asks_for_the_policy_event_and_hands_it_to_the_pep() {
     receiver.poll_once().unwrap();
     assert!(sp.decide(&login(), &access).is_permit());
     assert_eq!(pdp.count("/access/v1/evaluation"), 2, "the event cleared the cache");
+}
+
+/// The last heartbeat's `policyEvents` after `before` heartbeats were seen.
+fn next_policy_events(pdp: &Pdp, before: usize) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while pdp.count("/xacml/pep/heartbeat") <= before && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let beats = pdp.bodies("/xacml/pep/heartbeat");
+    assert!(beats.len() > before, "no heartbeat came");
+    beats.last().unwrap()["policyEvents"].clone()
+}
+
+struct Errors(Mutex<Vec<String>>);
+impl crate::Logger for Errors {
+    fn info(&self, _: &str) {}
+    fn warn(&self, _: &str) {}
+    fn error(&self, message: &str) { self.0.lock().unwrap().push(message.to_string()); }
+}
+
+/// oidc-caep-risc's live run (#46): a stream made while the PEP was
+/// `central` (no event asked for) was found and reused by the `local` PEP's
+/// receiver, so iya-sts never sent it `pep-policies-changed`. A reused stream
+/// now gets the missing type PATCHed in, and the PEP's heartbeat says
+/// `requested`, or `excluded` when the transmitter won't.
+#[test]
+fn a_reused_stream_gets_the_policy_event_added() {
+    let pdp = start_pdp();
+    let caep = "https://schemas.openid.net/secevent/caep/event-type/session-revoked";
+    let old = |tx: &crate::ssf_test::Transmitter, id: &str| json!({
+        "stream_id": id, "iss": tx.url, "aud": "my-app",
+        "delivery": {"method": "urn:ietf:rfc:8936", "endpoint_url": format!("{}/ssf/poll/{id}", tx.url)},
+        "events_requested": [caep], "events_delivered": [caep]
+    });
+    let errors = Arc::new(Errors(Mutex::new(Vec::new())));
+    let options = |tx: &crate::ssf_test::Transmitter, pep| ReceiverOptions {
+        transmitter: tx.url.clone(),
+        on_end_sessions: Some(Arc::new(|_: &[String], _: &crate::SignalEvent| Ok(()))),
+        poll_interval_ms: 60_000,
+        log: Some(errors.clone() as Arc<dyn crate::Logger>),
+        pep,
+        ..ReceiverOptions::default()
+    };
+    // No ssf block, so the PEP starts out reporting `none`: a `requested`
+    // heartbeat can only come from the receiver.
+    let sp = create(json!({"pep": pep_section(&pdp, "reuse", json!({"permitCacheMs": 30000, "heartbeatIntervalMs": 1000}))})).unwrap();
+    let tx = start_transmitter(false);
+    tx.add_stream(old(&tx, "old"));
+    let receiver = SignalsReceiver::new(options(&tx, sp.pep().cloned())).unwrap();
+    let before = pdp.count("/xacml/pep/heartbeat");
+    receiver.start().unwrap();
+    receiver.stop();
+    assert_eq!(tx.created(), 0, "the stream was reused, not made again");
+    let patches = tx.patches();
+    assert_eq!(patches.len(), 1, "{patches:?}");
+    assert_eq!(patches[0]["stream_id"], "old");
+    let asked: Vec<&str> = patches[0]["events_requested"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    assert!(asked.contains(&caep), "what it asked for before is kept: {asked:?}");
+    assert!(asked.contains(&POLICIES_CHANGED_EVENT), "the policy event is added: {asked:?}");
+    let stream = receiver.stream();
+    assert!(stream["events_delivered"].as_array().unwrap().iter().any(|e| e == POLICIES_CHANGED_EVENT));
+    assert_eq!(stream["delivery"]["endpoint_url"], format!("{}/ssf/poll/old", tx.url), "the delivery the listing gave is kept");
+    assert!(errors.0.lock().unwrap().is_empty(), "{:?}", errors.0.lock().unwrap());
+    assert_eq!(next_policy_events(&pdp, before), "requested");
+
+    // Nothing missing: no PATCH.
+    let again = SignalsReceiver::new(options(&tx, sp.pep().cloned())).unwrap();
+    again.start().unwrap();
+    again.stop();
+    assert_eq!(tx.patches().len(), 1, "a stream that already carries the event is left alone");
+
+    // A transmitter that refuses: the receiver still starts, says so, and
+    // the PEP's heartbeat reports the event excluded.
+    let tx = start_transmitter(false);
+    tx.refuse_patch();
+    tx.add_stream(old(&tx, "fixed"));
+    let refused = SignalsReceiver::new(options(&tx, sp.pep().cloned())).unwrap();
+    refused.start().unwrap();
+    refused.stop();
+    assert_eq!(tx.patches().len(), 1);
+    assert!(errors.0.lock().unwrap().iter().any(|l| l.contains("answered 405")), "{:?}", errors.0.lock().unwrap());
+    assert_eq!(next_policy_events(&pdp, pdp.count("/xacml/pep/heartbeat")), "excluded");
 }
 
 struct Quiet;

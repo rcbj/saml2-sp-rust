@@ -32,6 +32,7 @@ The embedded PEP (#40, iya-sts#1206 work item 8), behind the `pep` feature (`loc
 - `src/pep_test.rs` has its own stub PDP (on `support::serve`, which now records headers) and reuses `ssf_test.rs`'s transmitter. The no-feature refusal is in `sp_test.rs`. The `test` stage runs `cargo test` and then `cargo test --all-features`; the demo image builds with `--features local`.
 - **The dependency is a git dependency on iya-pep-rust's `feature/1`** until that crate's first release. Switch it to the crates.io version then, because crates.io refuses a git dependency at publish.
 - The live test of the PEP waits for iya-sts #2026–#2028.
+- oidc-caep-risc's live run (its #46) found two defects; both are held here by `src/pep_test.rs`. `from_file` keeps the `pep` section (`from_file_keeps_the_pep_section`; this library's reader always did). A reused poll stream gets the event types it lacks PATCHed in (`with_requested_events`); a refusal goes to the logger's `error`, and `start` tells the PEP `set_event_stream(Requested)` or `Excluded` from the stream's events, which the heartbeat reports as `policyEvents` (`a_reused_stream_gets_the_policy_event_added`, with PATCH on `ssf_test.rs`'s transmitter).
 - **The user guide is `docs/remote-pep.md`**, generated for the four Rust libraries from one outline; keep its sections in step with the siblings' when changing it. The README's section is a summary that links to it.
 
 ## Layout

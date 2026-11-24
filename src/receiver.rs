@@ -144,6 +144,10 @@ struct Inner {
     poll_interval: Duration,
     max_events: u64,
     log: Arc<dyn Logger>,
+    /// The PEP whose policy events this stream carries, told by `start`
+    /// whether the stream does.
+    #[cfg(feature = "pep")]
+    pep: Option<Arc<crate::pep::Pep>>,
     state: Mutex<State>,
     sched: Mutex<Sched>,
     gate: Gate,
@@ -170,7 +174,9 @@ impl SignalsReceiver {
         let mut handlers: HashMap<String, Vec<Handler>> = HashMap::new();
         // The embedded PEP's policy events ride this stream (iya-sts#1206 D4).
         #[cfg(feature = "pep")]
-        if let Some(pep) = opt.pep.filter(|pep| crate::pep::wants_events(pep)) {
+        let event_pep = opt.pep.filter(|pep| crate::pep::wants_events(pep));
+        #[cfg(feature = "pep")]
+        if let Some(pep) = event_pep.clone() {
             if !requested.iter().any(|e| e == crate::pep::POLICIES_CHANGED_EVENT) {
                 requested.push(crate::pep::POLICIES_CHANGED_EVENT.to_string());
             }
@@ -204,6 +210,8 @@ impl SignalsReceiver {
                 poll_interval: Duration::from_millis(interval),
                 max_events,
                 log,
+                #[cfg(feature = "pep")]
+                pep: event_pep,
                 state: Mutex::new(State {
                     config: Map::new(),
                     stream: Map::new(),
@@ -261,6 +269,13 @@ impl SignalsReceiver {
         self.inner.state.lock().expect("state").config = config;
         self.jwks(true)?;
         let stream = self.ensure_stream()?;
+        // The PEP's heartbeat says whether this stream carries its event.
+        #[cfg(feature = "pep")]
+        if let Some(pep) = &self.inner.pep {
+            let carries = |name: &str| stream.get(name).and_then(Value::as_array).map(|list| list.iter().any(|v| v.as_str() == Some(crate::pep::POLICIES_CHANGED_EVENT)));
+            let carried = carries("events_delivered").or_else(|| carries("events_requested")).unwrap_or(true);
+            pep.set_event_stream(if carried { crate::pep::EventStream::Requested } else { crate::pep::EventStream::Excluded });
+        }
         let endpoint = stream.get("delivery").and_then(|d| d.get("endpoint_url")).and_then(|v| v.as_str()).unwrap_or("");
         if endpoint.is_empty() {
             return Err(err("ssf", "the stream has no poll endpoint_url"));
@@ -633,7 +648,7 @@ impl SignalsReceiver {
                 }
                 let method = stream.get("delivery").and_then(|d| d.get("method")).map(string_of).unwrap_or_default();
                 if method == POLL_METHOD {
-                    return Ok(stream.clone());
+                    return Ok(self.with_requested_events(stream.clone(), &endpoint));
                 }
             }
         } else if status != 404 {
@@ -655,6 +670,47 @@ impl SignalsReceiver {
             return Err(err("ssf", format!("creating a stream at {endpoint} answered {created_status}: {text}")));
         }
         Ok(stream)
+    }
+
+    /// A stream found rather than created can predate an event type this
+    /// receiver asks for now: the embedded PEP's `pep-policies-changed`,
+    /// added once the configuration gained a `pep` section (or moved from
+    /// `central` to `local`). Reused as it was, the transmitter never sends
+    /// that type and the PEP hears of a change only on its fallback poll.
+    /// PATCH merges the missing types in (SSF 1.0, updating a stream). A
+    /// transmitter that refuses leaves the stream as it was, and the refusal
+    /// goes to the logger's `error`; the receiver still starts.
+    fn with_requested_events(&self, stream: Map<String, Value>, endpoint: &str) -> Map<String, Value> {
+        let listed = |name: &str| stream.get(name).and_then(Value::as_array).map(|list| list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect::<Vec<_>>());
+        let Some(requested) = listed("events_requested").or_else(|| listed("events_delivered")) else {
+            return stream;
+        };
+        let missing: Vec<String> = self.inner.events_requested.iter().filter(|e| !requested.contains(e)).cloned().collect();
+        if missing.is_empty() {
+            return stream;
+        }
+        let stream_id = string_of(stream.get("stream_id").unwrap_or(&Value::Null));
+        let mut merged = requested;
+        merged.extend(missing.iter().cloned());
+        let body = json!({"stream_id": stream_id, "events_requested": merged});
+        let line = match self.call("PATCH", endpoint, Some(&body)) {
+            Ok((200, Value::Object(mut updated))) if string_of(updated.get("stream_id").unwrap_or(&Value::Null)) == stream_id => {
+                if !updated.contains_key("delivery") {
+                    if let Some(delivery) = stream.get("delivery") {
+                        updated.insert("delivery".into(), delivery.clone());
+                    }
+                }
+                return updated;
+            }
+            Ok((status, parsed)) => {
+                let mut text = parsed.to_string();
+                if text.len() > 300 { text.truncate(300); }
+                format!("ssf: adding {} to stream {stream_id} answered {status}: {text}", missing.join(", "))
+            }
+            Err(error) => format!("ssf: adding {} to stream {stream_id} failed: {error}", missing.join(", ")),
+        };
+        self.inner.log.error(&line);
+        stream
     }
 }
 
