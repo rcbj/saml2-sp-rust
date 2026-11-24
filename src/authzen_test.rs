@@ -201,6 +201,12 @@ fn pip_answer(table: &Value, query: &str) -> String {
     out
 }
 
+/// The applications that enforce fine-grained authorization, as iya-sts's
+/// catalogue pull names them: this SP's in the `application` phase.
+fn fga_applications(phase: &str) -> Value {
+    if phase == "application" { json!([SP_ENTITY]) } else { json!([]) }
+}
+
 fn stub(phase: &'static str) -> (TestServer, String) {
     let table = Arc::new(table());
     let server = serve(Arc::new(move |req| {
@@ -211,9 +217,9 @@ fn stub(phase: &'static str) -> (TestServer, String) {
         }
         match path.as_str() {
             "/oauth2/token" => write(200, json!({"access_token": "azn-token", "token_type": "DPoP", "expires_in": 300})),
-            "/xacml/pep/register" => write(201, json!({"registered": true})),
+            "/xacml/pep/register" => write(201, json!({"registered": true, "identity": "uid=pep-azn,ou=users,dc=azn"})),
             "/xacml/pep/heartbeat" => write(200, json!({"acknowledged": true, "current": true})),
-            "/xacml/pep/authzen-catalogue" => write(200, json!({"syncToken": "azn-c", "realm": "azn", "rows": table["catalogue"], "settings": {"obligationsProfile": true}})),
+            "/xacml/pep/authzen-catalogue" => write(200, json!({"syncToken": "azn-c", "realm": "azn", "rows": table["catalogue"], "fgaApplications": fga_applications(phase), "settings": {"obligationsProfile": true}})),
             "/xacml/pep/policies" => write(200, pulled(&table, phase)),
             "/xacml/pip" => (200, "application/xml", pip_answer(&table, &String::from_utf8_lossy(&req.body)).into_bytes()),
             "/admin-api/pep-audit" => write(200, json!({"acknowledged": 0})),
@@ -257,16 +263,9 @@ fn the_table_decides_as_it_says_offline() {
             run += 1;
             let decision = ask(&sp, &table, case);
             let answer = answer_of(&decision);
-            // A case the local engine is known to get wrong (a defect outside
-            // this library) is held to its present answer here, so the tag
-            // must go when the defect is fixed. The live test has no such
-            // exception.
-            let (want, defect) = match case.get("localDefect") {
-                Some(d) => (&d["answer"], true),
-                None => (&case["expect"], false),
-            };
+            let want = &case["expect"];
             if !is_expected(&answer, want) {
-                failures.push(format!("{} [{phase}]: {answer} ({}), {} {want}", case["name"], why(&decision), if defect { "the known defect answers" } else { "the table says" }));
+                failures.push(format!("{} [{phase}]: {answer} ({}), the table says {want}", case["name"], why(&decision)));
             }
         }
     }
