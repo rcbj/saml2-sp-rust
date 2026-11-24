@@ -30,6 +30,8 @@ api() { curl -s -H "Authorization: Bearer $TOKEN" \
 
 Register the service provider in iya-sts as usual; `scripts/configure_iya_sts.py` does it for the demo. Note its identifier: it is the `application` the PEP is bound to (`entityId` by default).
 
+For the demo, `scripts/configure_iya_sts.py --pep central` (or `local`) does this step and steps 2 to 6 in one run; see *The demo* below.
+
 ### 2. Create the PEP's service account
 
 The PEP signs in as a service account of its own, never as a person or as the application:
@@ -236,6 +238,18 @@ The live run found two differences, both about an application that enforces fine
 ## The demo
 
 Built with `local` (the Dockerfile does), the demo protects `GET /orders/<id>` with the PEP when `demo/saml.json` has a `pep` section: 401 without a sign-in, 200 on a Permit, 403 on a Deny and 503 on `Unavailable`.
+
+One command sets the demo up with its PEP: the install script with `--pep central` or `--pep local` (and `--pep-name`, default `pep-saml-demo`). After registering the service provider it does steps 2 to 6: the service account in `remote-peps`; a P-256 key made with `openssl` in `demo/generated/pep-key.pem` (0600, never printed, never in the image), certified and bound to the demo's application; the catalogue row `subject.acr` (`AuthnContextClassRef`, as `urn:saml-sp-demo:acr`); and the demo application's own policy, which it enforces, permitting `read` on an `order` when the sign-in carried an `AuthnContextClassRef` and denying everything else. The realm root is never touched. It then writes the `pep` section (`name`, `mode`, `assertionKey: generated/pep-key.pem`) into `demo/saml.json`, keeping the other members. `--dry-run` lists every call.
+
+```sh
+docker compose build
+docker run --rm --network host --user "$(id -u):$(id -g)" -e HOME=/tmp \
+  -v "$PWD/demo:/app/demo" -e ADMIN_API_CLIENT_SECRET -e IYA_STS_URL \
+  saml2-sp-rust-demo python3 scripts/configure_iya_sts.py --pep local
+docker compose up --build
+```
+
+Run it again against the same iya-sts to switch the mode: the account, the key and the policy (with any edits an administrator made) are kept, and the PEP is bound again. Against a new iya-sts the kept key is certified there. `GET /live-status` shows the PEP's `status()` under `pep`.
 
 ## See also
 

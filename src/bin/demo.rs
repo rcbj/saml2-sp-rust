@@ -351,7 +351,19 @@ fn live_status(app: &App) -> Response {
     };
     let receiver = app.receiver_state.lock().expect("state").clone();
     let events: Vec<Value> = app.events.lock().expect("events").iter().map(|item| json!({"type": item.event_type, "jti": item.jti})).collect();
-    let body = json!({"signedIn": signed_in, "subject": subject, "receiver": receiver, "events": events});
+    #[allow(unused_mut)]
+    let mut body = json!({"signedIn": signed_in, "subject": subject, "receiver": receiver, "events": events});
+    // The PEP's status holds no secret; its syncToken is the policy's version.
+    #[cfg(feature = "pep")]
+    if let Some(pep) = provider(app).ok().and_then(|sp| sp.pep()) {
+        let s = pep.status();
+        body["pep"] = json!({
+            "name": s.name, "mode": if s.mode == saml2_sp::pep::Mode::Local { "local" } else { "central" }, "application": s.application,
+            "registered": s.registered, "running": s.running, "holdsPolicy": s.holds_policy,
+            "policyCount": s.policy_count, "syncToken": s.sync_token, "eventStream": s.event_stream.as_str(),
+            "eventsReceived": s.events_received, "decisions": s.decisions, "lastError": s.last_error,
+        });
+    }
     text(200, "application/json", &body.to_string())
 }
 

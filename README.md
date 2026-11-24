@@ -66,6 +66,20 @@ match sp.decide_session(&receiver.session_index(), &local_id, &login, &Access::n
 
 The section is off unless present, and a build without the feature refuses it. The PEP's key must be its own, and only the claims the realm's AuthZEN catalogue declares are sent. The demo protects `GET /orders/<id>` with the PEP.
 
+## The demo with its embedded PEP
+
+With iya-sts running (one with #2026–#2028, the embedded-PEP support), one run of the install script registers the demo and sets up its PEP, then the demo starts with it:
+
+```sh
+docker compose build
+docker run --rm --network host --user "$(id -u):$(id -g)" -e HOME=/tmp \
+  -v "$PWD/demo:/app/demo" -e ADMIN_API_CLIENT_SECRET -e IYA_STS_URL \
+  saml2-sp-rust-demo python3 scripts/configure_iya_sts.py --pep local
+docker compose up --build
+```
+
+`--pep central` or `--pep local` picks the mode, and running it again switches it, keeping the PEP's account, its key (`demo/generated/pep-key.pem`, 0600, never in the image) and the demo application's own policy. It never changes the realm's root policy. Sign in, then `GET /orders/42` is allowed and any other method is denied. [docs/remote-pep.md](docs/remote-pep.md#the-demo) lists what it does.
+
 ## Tests
 
 ```bash

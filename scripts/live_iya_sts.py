@@ -32,6 +32,18 @@ clones main (or builds IYA_STS_SRC). It removes only the containers it started,
 iya-sts-live-saml2-sp-rust and saml2-sp-rust-live-demo, and never removes
 iya-sts-live-main, iya-sts-live-probe, or a container whose name starts with
 sts, openbao, or xacml-pep.
+
+--pep (or LIVE_PEP=1) adds the demo's embedded PEP and needs an iya-sts with
+#2026-#2028 (IYA_STS_IMAGE). The PEP is set up by the install script itself,
+run with --pep central, exactly as a user would: its key lands in
+demo/generated/pep-key.pem (never in the image; mounted file by file), and a
+copy of the configuration that says local is demo/saml.pep-local.json. The
+demo runs central first: GET /orders/42 must be 200 and POST 403. After the
+two Shared Signals checks it runs again with SAML_CONFIG naming the local copy:
+the same two, then the application's OWN policy (never the realm root) moves
+to one that denies read, and within PEP_FLIP_TIMEOUT seconds (30) the GET
+must be 403 with pep-policies-changed received. The fallback poll stays at its
+300 s default, so a change within the bound came through the event.
 """
 
 import base64
@@ -587,6 +599,125 @@ def wait_for(driver, predicate, what):
     raise RuntimeError(f"timed out waiting for {what}: {json.dumps(last)[:600]}")
 
 
+# The embedded PEP (--pep). Its names, key path and policy are the install
+# script's: --pep central sets the PEP up here.
+from configure_iya_sts import PEP_KEY, orders_policy  # noqa: E402
+
+PEP_LOCAL_CONFIG = "saml.pep-local.json"
+
+
+def flip_policy(client, sts_origin, token, application):
+    """The demo application's own policy (the install script's) now denies read too."""
+    status, page = admin_json(client, sts_origin, token, "GET",
+                              "/admin-api/applications?application=" + urllib.parse.quote(application, safe=""))
+    fga = ((page.get("page") or {}).get("fga") or {}) if status == 200 else {}
+    name = (fga.get("policy") or {}).get("name") or fga.get("reference")
+    if not name:
+        raise RuntimeError(f"the application's page names no policy of its own: {json.dumps(fga)[:400]}")
+    status, parsed = admin_json(client, sts_origin, token, "POST", "/admin-api/xacml/import-alfa",
+                                {"name": name, "alfa": orders_policy("samlspdemolocked", "deny")})
+    if status != 200 or parsed.get("ok") is False:
+        raise RuntimeError(f"rewriting the application's policy answered {status}: {json.dumps(parsed)[:400]}")
+    print("the application's own policy now denies read on an order", flush=True)
+
+
+def local_copy(config, dest):
+    """The install script wrote a central pep section; a copy says local."""
+    raw = json.loads(config.read_text(encoding="utf-8"))
+    if not isinstance(raw.get("pep"), dict) or raw["pep"].get("mode") != "central":
+        raise RuntimeError(f"the install script did not write a central pep section: {json.dumps(raw.get('pep'))}")
+    raw["pep"] = dict(raw["pep"], mode="local")
+    dest.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+    return raw["entityId"]
+
+
+def order(driver, method):
+    status, _headers, payload = driver.client.request(method, driver.demo_origin + "/orders/42",
+                                                      body=b"" if method == "POST" else None, headers={"accept": "text/html"})
+    print(f"{method} {status} demo /orders/42", flush=True)
+    return status, payload
+
+
+def pep_checks(driver, mode):
+    """GET is read (Permit, 200) and POST is write (Deny, 403)."""
+    deadline = time.time() + 60
+    state = {}
+    while time.time() < deadline:
+        state = driver.status().get("pep") or {}
+        if state.get("registered") and (mode == "central" or state.get("holdsPolicy")):
+            break
+        time.sleep(1)
+    else:
+        raise RuntimeError(f"the {mode} PEP did not get ready: {json.dumps(state)[:600]}")
+    if state.get("mode") != mode:
+        raise RuntimeError(f"the demo's PEP is {state.get('mode')}, not {mode}")
+    read_status, read_body = order(driver, "GET")
+    write_status, write_body = order(driver, "POST")
+    if read_status != 200 or write_status != 403:
+        why = (read_body if read_status != 200 else write_body)[:400].decode("utf-8", "replace")
+        raise RuntimeError(f"{mode}: GET /orders/42 answered {read_status}, POST {write_status}: {why}")
+    checks = {"mode": state.get("mode"), "registered": True, "readIs200": True, "writeIs403": True}
+    if mode == "local":
+        checks["policyCount"] = state.get("policyCount")
+    return checks
+
+
+def flip_check(driver, client, sts_origin, token, application):
+    """local: the application's policy moves to deny read, and the PEP hears of it."""
+    before = driver.status().get("pep") or {}
+    flipped_at = time.time()
+    flip_policy(client, sts_origin, token, application)
+    limit = float(os.environ.get("PEP_FLIP_TIMEOUT") or 30)
+    status = None
+    while time.time() - flipped_at < limit:
+        status, _body = order(driver, "GET")
+        if status == 403:
+            break
+        time.sleep(1)
+    after = driver.status().get("pep") or {}
+    result = {
+        "readIs403AfterFlip": status == 403,
+        "seconds": round(time.time() - flipped_at, 1),
+        "eventReceived": (after.get("eventsReceived") or 0) > (before.get("eventsReceived") or 0),
+        "syncTokenMoved": bool(after.get("syncToken")) and after.get("syncToken") != before.get("syncToken"),
+    }
+    result["via"] = "event" if result["eventReceived"] and result["readIs403AfterFlip"] and result["seconds"] < 300 else "poll"
+    if status != 403 or result["via"] != "event":
+        raise RuntimeError(f"local: after the flip {json.dumps(result)}; pep {json.dumps(after)[:600]}")
+    return result
+
+
+def start_demo(image, demo_name, demo_port, demo_origin, mounts, env=None):
+    """A fresh demo container with only `mounts` (file by file, read-only)."""
+    docker_rm(demo_name)
+    args = ["run", "-d", "--name", demo_name, "--network", "host"]
+    for source, target in mounts:
+        args += ["-v", f"{source}:{target}:ro"]
+    args += ["-e", f"PORT={demo_port}", "-e", f"PUBLIC_URL={demo_origin}"]
+    for name, value in (env or {}).items():
+        args += ["-e", f"{name}={value}"]
+    docker(*args, image, "saml-demo", "--public-url", demo_origin)
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", demo_port, timeout=3)
+            conn.request("GET", "/healthz")
+            response = conn.getresponse()
+            body = response.read()
+            conn.close()
+            if response.status == 200 and body == b"ok":
+                return
+        except OSError:
+            pass
+        time.sleep(1)
+    logs = subprocess.run(["docker", "logs", demo_name], check=False, text=True, capture_output=True)
+    if logs.stdout:
+        print(logs.stdout, flush=True)
+    if logs.stderr:
+        print(logs.stderr, file=sys.stderr, flush=True)
+    raise RuntimeError("the demo /healthz did not answer ok")
+
+
 def prepare_sts(sts_port, secret):
     given = os.environ.get("IYA_STS_URL", "").rstrip("/")
     if given:
@@ -623,7 +754,7 @@ def prepare_sts(sts_port, secret):
     return f"https://127.0.0.1:{sts_port}", name
 
 
-def configure_demo(work, sts_origin, demo_origin, demo_port, username, password, secret, image):
+def configure_demo(work, sts_origin, demo_origin, demo_port, username, password, secret, image, pep=False):
     """Run the registrar in the demo image, as this user, on the host network.
 
     The secrets reach the container by name (`-e NAME`), so they are not on the
@@ -647,6 +778,7 @@ def configure_demo(work, sts_origin, demo_origin, demo_port, username, password,
         "--idp", sts_origin,
         "--public-url", demo_origin,
         "--test-user", username,
+        *(["--pep", "central"] if pep else []),
         env=env,
         capture_output=True,
     )
@@ -657,6 +789,7 @@ def configure_demo(work, sts_origin, demo_origin, demo_port, username, password,
 
 
 def main():
+    pep = "--pep" in sys.argv[1:] or os.environ.get("LIVE_PEP", "") in ("1", "true", "yes")
     sts_port = int(os.environ.get("LIVE_STS_PORT") or 18518)
     demo_port = int(os.environ.get("LIVE_DEMO_PORT") or 18618)
     sts_given = bool(os.environ.get("IYA_STS_URL", "").strip())
@@ -682,50 +815,33 @@ def main():
         # (as a fresh clone would), let the registrar write the chain where idpCa
         # names it, then build again: only the demo/ layer changes.
         docker("build", "-t", image, str(context))
-        configure_demo(demo_dir, sts_origin, demo_origin, demo_port, username, password, secret, image)
+        configure_demo(demo_dir, sts_origin, demo_origin, demo_port, username, password, secret, image, pep=pep)
         ca_file = demo_dir / "generated" / "idp-ca.pem"
         if not ca_file.exists():
             raise RuntimeError(f"the registrar did not write {ca_file}")
+        pep_key = demo_dir / PEP_KEY
+        pep_result = {}
+        if pep:
+            # The install script set the PEP up (--pep central) and wrote its section;
+            # the local run uses a copy that says local. Both go into the image, the key never.
+            if not pep_key.exists():
+                raise RuntimeError("the install script did not make the PEP's key")
+            application = local_copy(demo_dir / "saml.json", demo_dir / PEP_LOCAL_CONFIG)
+            pep_result = {"application": application, "name": json.loads((demo_dir / "saml.json").read_text(encoding="utf-8"))["pep"]["name"]}
         docker("build", "-t", image, str(context))
+        if pep:
+            listed = docker("run", "--rm", image, "ls", "-A", "demo/generated", capture_output=True).stdout.split()
+            if listed != ["idp-ca.pem"]:
+                raise RuntimeError(f"the demo image's demo/generated holds {listed}, not only the trust chain")
         baked = docker("run", "--rm", image, "cat", "demo/generated/idp-ca.pem", capture_output=True)
         if baked.stdout != ca_file.read_text(encoding="utf-8"):
             raise RuntimeError("the demo image does not carry the chain the registrar wrote")
         chain_count = baked.stdout.count("BEGIN CERTIFICATE")
         print(f"the demo image carries the {chain_count}-certificate chain at /app/demo/generated/idp-ca.pem", flush=True)
-        docker_rm(demo_name)
-        mounts = []
-        for name in ("sp.key", "sp.crt", "idp-metadata.xml"):
-            mounts += ["-v", f"{demo_dir / 'generated' / name}:/app/demo/generated/{name}:ro"]
-        docker(
-            "run", "-d", "--name", demo_name, "--network", "host",
-            *mounts,
-            "-e", f"PORT={demo_port}",
-            "-e", f"PUBLIC_URL={demo_origin}",
-            image,
-            "saml-demo", "--public-url", demo_origin,
-        )
-        deadline = time.time() + 90
-        healthy = False
-        while time.time() < deadline:
-            try:
-                conn = http.client.HTTPConnection("127.0.0.1", demo_port, timeout=3)
-                conn.request("GET", "/healthz")
-                response = conn.getresponse()
-                body = response.read()
-                conn.close()
-                if response.status == 200 and body == b"ok":
-                    healthy = True
-                    break
-            except OSError:
-                pass
-            time.sleep(1)
-        if not healthy:
-            logs = subprocess.run(["docker", "logs", demo_name], check=False, text=True, capture_output=True)
-            if logs.stdout:
-                print(logs.stdout, flush=True)
-            if logs.stderr:
-                print(logs.stderr, file=sys.stderr, flush=True)
-            raise RuntimeError("the demo /healthz did not answer ok")
+        mounts = [(demo_dir / "generated" / name, f"/app/demo/generated/{name}") for name in ("sp.key", "sp.crt", "idp-metadata.xml")]
+        if pep:
+            mounts.append((pep_key, "/app/demo/" + PEP_KEY))
+        start_demo(image, demo_name, demo_port, demo_origin, mounts)
         client = Client(ca_file)
         driver = Driver(client, sts_origin, demo_origin, username, password)
         driver.sign_in()
@@ -735,6 +851,8 @@ def main():
             "a signed-in demo polling its stream",
         )
         print(f"signed in as {signed_in.get('subject')}; {signed_in.get('receiver')}", flush=True)
+        if pep:
+            pep_result["central"] = pep_checks(driver, "central")
         token = mint_admin(client, sts_origin, secret)
         session_id = session_id_for(client, sts_origin, token, username)
         emit(client, sts_origin, token, session_id, "credential-change")
@@ -753,7 +871,20 @@ def main():
             ),
             "session-revoked to end the local session",
         )
-        print(json.dumps({"ok": True, "subject": signed_in.get("subject"), "idpCaInImage": chain_count, "events": finished.get("events")}, indent=2))
+        result = {"ok": True, "subject": signed_in.get("subject"), "idpCaInImage": chain_count, "events": finished.get("events")}
+        if pep:
+            # THEN local: the same image and iya-sts, the copy that says local.
+            start_demo(image, demo_name, demo_port, demo_origin, mounts, env={"SAML_CONFIG": "/app/demo/" + PEP_LOCAL_CONFIG})
+            local_driver = Driver(Client(ca_file), sts_origin, demo_origin, username, password)
+            local_driver.sign_in()
+            wait_for(local_driver, lambda row: row.get("signedIn") is True and "polling" in str(row.get("receiver") or ""),
+                     "a signed-in local-mode demo polling its stream")
+            local = pep_checks(local_driver, "local")
+            token = mint_admin(client, sts_origin, secret)
+            local["policyChange"] = flip_check(local_driver, client, sts_origin, token, pep_result["application"])
+            pep_result["local"] = local
+            result["pep"] = pep_result
+        print(json.dumps(result, indent=2))
     finally:
         if sys.exc_info()[0] is not None and demo_name:
             logs = subprocess.run(["docker", "logs", demo_name], check=False, text=True, capture_output=True)

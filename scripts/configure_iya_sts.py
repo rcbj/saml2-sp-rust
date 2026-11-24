@@ -9,6 +9,15 @@ It uses the saml2-sp binary on PATH (the demo image installs one), and falls bac
 It writes iya-sts's listener CA trust chain (leaf, TLS Issuing CA, Intermediate, Root) to the file
 idpCa names, every run. The demo image build copies that file in, so rebuild the image after running
 this against a different iya-sts.
+
+--pep central|local also sets the demo up with its embedded PEP (docs/remote-pep.md, steps 2 to 6):
+the PEP's service account in remote-peps; a P-256 key made here with openssl in generated/pep-key.pem
+beside the configuration (0600, never printed, kept out of the image by .dockerignore), certified from
+its own request with the PEP bound to the demo's application; the catalogue row the demo's policy reads;
+and the demo application's OWN policy, which it then enforces, so the realm root is never touched. It
+writes the `pep` section into the configuration. Run again against the same iya-sts, it keeps the
+account, the key and the policy (an administrator's edits survive), binds the PEP again and switches
+the mode.
 """
 
 from __future__ import annotations
@@ -38,10 +47,49 @@ ENCRYPTION = {
 }
 MULTIPLE_ACCOUNTS = {"key": "authn.multipleAccounts", "value": True}
 
+# The embedded PEP (--pep). PEP_KEY is relative to the configuration's directory, and the `pep`
+# section names it that way too: this library reads a relative assertionKey from there, as it reads
+# privateKey.
+PEP_MODES = ("central", "local")
+PEP_NAME = "pep-saml-demo"
+PEP_KEY = "generated/pep-key.pem"
+PEP_GROUP = "remote-peps"
+PEP_EVENT = "urn:iya:sts:secevent:event-type:pep-policies-changed"
+ACR_ATTRIBUTE = "urn:saml-sp-demo:acr"
+
+
+def orders_policy(namespace: str = "samlspdemo", read_effect: str = "permit") -> str:
+    """The demo application's own policy, in ALFA: `read` on an `order` is `read_effect`, and
+    everything else (the demo's `write`) is denied. A Permit also needs the sign-in's
+    AuthnContextClassRef, which reaches the policy only through the catalogue row, so a 200 shows
+    the claim arrived."""
+    needs_acr = "                condition integerGreaterThan(stringBagSize(acr), 0)\n" if read_effect == "permit" else ""
+    return (
+        f"namespace {namespace} {{\n"
+        '    attribute action { category = actionCat id = "urn:oasis:names:tc:xacml:1.0:action:action-id" type = string }\n'
+        '    attribute kind { category = resourceCat id = "urn:sts:xacml:authzen:resource-type" type = string }\n'
+        f'    attribute acr {{ category = subjectCat id = "{ACR_ATTRIBUTE}" type = string }}\n'
+        f"    policy {namespace}Orders {{\n"
+        f'        id = "urn:saml-sp-demo:{namespace}:orders"\n'
+        "        apply firstApplicable\n"
+        "        rule readAnOrder {\n"
+        f"            {read_effect}\n"
+        '            target clause action == "read"\n'
+        '            target clause kind == "order"\n'
+        f"{needs_acr}"
+        "        }\n"
+        "        rule nothingElse {\n"
+        "            deny\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+    )
+
 
 def usage() -> str:
     return """Usage: python scripts/configure_iya_sts.py [--config path] [--idp url] [--public-url url]
-                                        [--test-user name | --no-test-user] [--dry-run]
+                                        [--test-user name | --no-test-user]
+                                        [--pep central|local] [--pep-name name] [--dry-run]
 
   --config        The demo's SAML configuration (default: demo/saml.json)
   --idp           iya-sts's base URL; the realm's, e.g. https://host/realm/acme, for a trust realm
@@ -55,6 +103,11 @@ def usage() -> str:
                   path is printed. With $SAML_DEMO_USER_PASSWORD set, an existing user's
                   password is replaced.
   --no-test-user  Do not create a test user.
+  --pep           Also set up the demo's embedded PEP in this mode (central or local): its service
+                  account, a key of its own in generated/pep-key.pem (0600), its certificate and
+                  binding, the catalogue row, the demo application's own policy (enforced), and the
+                  `pep` section in the configuration. Safe to run again; the mode is switched.
+  --pep-name      The PEP's service account (default: pep-saml-demo).
   --dry-run       Print what would be done, and send nothing.
 
 The management API secret is ADMIN_API_CLIENT_SECRET or STS_ADMIN_API_CLIENT_SECRET."""
@@ -136,6 +189,8 @@ def parse_args(argv: list[str], env: dict | None = None) -> Args:
         public_url=str(env.get("PUBLIC_URL") or "http://localhost:3000").rstrip("/"),
         public_url_given=bool(env.get("PUBLIC_URL")),
         test_user="saml-demo-user",
+        pep="",
+        pep_name=PEP_NAME,
         dry_run=False,
         help=False,
     )
@@ -163,6 +218,14 @@ def parse_args(argv: list[str], env: dict | None = None) -> Args:
             out.test_user = value().strip()
         elif arg == "--no-test-user":
             out.test_user = ""
+        elif arg == "--pep":
+            out.pep = value().strip()
+            if out.pep not in PEP_MODES:
+                raise SystemExit(f"--pep must be central or local, not {out.pep}")
+        elif arg == "--pep-name":
+            out.pep_name = value().strip()
+            if not out.pep_name:
+                raise SystemExit("--pep-name is empty")
         elif arg == "--dry-run":
             out.dry_run = True
         else:
@@ -376,6 +439,9 @@ def main(argv: list[str] | None = None) -> None:
         for call in plan_for(files, base, args.test_user, xml):
             body = f"\n{json.dumps(call['body'], indent=2)}" if call.get("body") is not None else ""
             print(f"{call['method']} {call['path']}  # {call['why']}{body}")
+        if args.pep:
+            for line in pep_plan(files, base, args.pep_name, args.pep):
+                print(line)
         return
     if not Path(files.key).exists() and not Path(files.cert).exists():
         print("No key pair yet; generating one.")
@@ -489,7 +555,136 @@ def main(argv: list[str] | None = None) -> None:
                     os.fchmod(out.fileno(), 0o600)
                     out.write(f"{made['body']['password']}\n")
                 print(f"Generated a password for {args.test_user}; it is in {saved} (readable by you only).")
+    if args.pep:
+        def get(path: str) -> dict:
+            return _json(f"{base}/admin-api{path}", ca, "GET", {"accept": "application/json", "authorization": f"Bearer {token}"})
+        setup_pep(api, get, files, args.config, args.pep_name, args.pep)
+        print(f"pep: {args.pep_name}, {args.pep} (GET /orders/42 needs a sign-in; any other method is denied)")
     print("Done. Start the demo with: docker compose up --build")
+
+
+def pep_plan(files: DemoFiles, base: str, name: str, mode: str) -> list[str]:
+    """What --pep does, for --dry-run. No key is made and nothing is sent."""
+    app = files.entity_id
+    return [
+        f"GET  {base}/admin-api/users?user={name}  # the PEP's service account: created only if unknown",
+        f"POST {base}/admin-api/users/create  # {name}: a service account owned by admin-write, no credential",
+        f"POST {base}/admin-api/groups/add-member  # {name} in {PEP_GROUP}",
+        f"# make a P-256 key at {PEP_KEY} beside the configuration (0600), unless one is there",
+        f"POST {base}/admin-api/xacml/issue-pep-credential  # its certificate request, bound to {app} (a new key or account)",
+        f"POST {base}/admin-api/xacml/set-pep-application  # or, with both kept, bind {name} to {app} again",
+        f"POST {base}/admin-api/xacml/authzen/set-attribute  # subject.acr -> {ACR_ATTRIBUTE}",
+        f"POST {base}/admin-api/applications/fga-create-policy  # {app}'s own policy, unless it has one",
+        f"POST {base}/admin-api/xacml/import-alfa  # the demo policy into it, only while {app} enforces none",
+        f"POST {base}/admin-api/applications/fga-enable  # {app} enforces its own policy (the realm root is untouched)",
+        f"POST {base}/admin-api/applications/add  # {PEP_EVENT} in ssfAllowedEvents, only if {app} restricts them",
+        f"# write \"pep\": {{\"name\": \"{name}\", \"mode\": \"{mode}\", \"assertionKey\": \"{PEP_KEY}\"}} into the configuration",
+    ]
+
+
+def make_pep_key(key_file: Path) -> None:
+    """A P-256 key made with openssl, created 0600. Neither the key nor anything read from it is
+    printed; only its certificate request (pep_csr) leaves this machine."""
+    key_file.parent.mkdir(parents=True, exist_ok=True)
+    old = os.umask(0o077)
+    try:
+        made = subprocess.run(["openssl", "genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-out", str(key_file)],
+                              check=False, capture_output=True, text=True)
+    finally:
+        os.umask(old)
+    if made.returncode != 0:
+        raise SystemExit("openssl could not make the PEP's key (is openssl installed?)")
+    os.chmod(key_file, 0o600)
+
+
+def pep_csr(key_file: Path, name: str) -> str:
+    """The certificate request for the PEP's key."""
+    made = subprocess.run(["openssl", "req", "-new", "-key", str(key_file), "-subj", f"/CN={name}"],
+                          check=False, capture_output=True, text=True)
+    if made.returncode != 0 or "BEGIN CERTIFICATE REQUEST" not in made.stdout:
+        raise SystemExit("openssl could not make the PEP's certificate request from its key")
+    return made.stdout
+
+
+def _ok(answer: dict, what: str, allow: str = "") -> bool:
+    """True for an /admin-api act that worked, False for one refused only because it is already so
+    (`allow`, found in the refusal's words); anything else stops the script."""
+    body = answer["body"] if isinstance(answer["body"], dict) else {}
+    if answer["status"] == 200 and body.get("ok") is not False:
+        return True
+    words = (" ".join(_errors_of(body)) + " " + str(body.get("why") or "")).lower()
+    if allow and allow in words:
+        return False
+    raise SystemExit(f"{what}: refused ({answer['status']}): {json.dumps(body)[:400]}")
+
+
+def write_pep_section(config_path: str, name: str, mode: str) -> None:
+    """The configuration's `pep` section gets the name, the mode and the key; any other member
+    already in it is kept, and so is the rest of the file."""
+    path = Path(config_path)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    section = raw.get("pep") if isinstance(raw.get("pep"), dict) else {}
+    section.update({"name": name, "mode": mode, "assertionKey": PEP_KEY})
+    raw["pep"] = section
+    path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+
+
+def setup_pep(api, get, files: DemoFiles, config_path: str, name: str, mode: str) -> None:
+    """docs/remote-pep.md's steps 2 to 6 for the demo. Safe to run again."""
+    app = files.entity_id
+    # Step 2: the service account, in remote-peps.
+    made_account = get(f"/users?user={urllib.parse.quote(name)}")["body"].get("known") is not True
+    if made_account:
+        _ok(api("/users/create", {"username": name, "invent": False, "credential": "none", "serviceAccount": True,
+                                  "owners": ["admin-write"], "attributes": {"cn": name, "displayName": name}}),
+            f"creating the service account {name}")
+        print(f"Created the PEP's service account {name}.")
+    else:
+        print(f"The PEP's service account {name} already exists.")
+    _ok(api("/groups/add-member", {"group": PEP_GROUP, "member": name}), f"adding {name} to {PEP_GROUP}")
+    # Step 3: the key, certified from its own request, and the binding.
+    key_file = Path(config_path).resolve().parent / PEP_KEY
+    made_key = not key_file.exists()
+    if made_key:
+        make_pep_key(key_file)
+        print(f"Generated the PEP's P-256 key in {key_file} (readable by you only).")
+    if made_key or made_account:
+        _ok(api("/xacml/issue-pep-credential", {"name": name, "csr": pep_csr(key_file, name), "application": app}),
+            "certifying the PEP's key")
+        print(f"Certified the PEP's key and bound {name} to {app}.")
+    else:
+        _ok(api("/xacml/set-pep-application", {"name": name, "application": app}), f"binding {name} to {app}")
+        print(f"Kept the PEP's key; {name} is bound to {app}.")
+    # Step 4: the claim the policy reads.
+    _ok(api("/xacml/authzen/set-attribute", {"object": "subject", "property": "acr", "attributeId": ACR_ATTRIBUTE}),
+        "the catalogue row subject.acr")
+    # Step 5: the application's own policy, written only while it enforces none, so an
+    # administrator's edits survive a re-run. The realm root is never set.
+    page_path = f"/applications?application={urllib.parse.quote(app, safe='')}"
+    page = get(page_path)["body"].get("page") or {}
+    fga = page.get("fga") or {}
+    if fga.get("enforced") is True:
+        print(f"{app} already enforces its own policy; it is left as it is.")
+    else:
+        _ok(api("/applications/fga-create-policy", {"application": app}), f"{app}'s own policy", allow="already")
+        page = get(page_path)["body"].get("page") or {}
+        fga = page.get("fga") or {}
+        policy = (fga.get("policy") or {}).get("name") or fga.get("reference")
+        if not policy:
+            raise SystemExit(f"{app}'s page names no policy of its own: {json.dumps(fga)[:300]}")
+        _ok(api("/xacml/import-alfa", {"name": policy, "alfa": orders_policy()}), f"writing {policy}")
+        _ok(api("/applications/fga-enable", {"application": app}), f"enforcing {app}'s own policy")
+        print(f"{app} now enforces its own policy {policy}: read on an order needs an AuthnContextClassRef; anything else is denied.")
+    # Step 6: only an application that restricts its streams needs the event named.
+    allowed = (page.get("attributes") or {}).get("ssfAllowedEvents") or []
+    if isinstance(allowed, str):
+        allowed = [allowed]
+    if allowed and PEP_EVENT not in allowed:
+        _ok(api("/applications/add", {"application": app, "attribute": "ssfAllowedEvents", "value": PEP_EVENT}),
+            "letting pep-policies-changed through ssfAllowedEvents", allow="already")
+        print(f"Added {PEP_EVENT} to {app}'s ssfAllowedEvents.")
+    write_pep_section(config_path, name, mode)
+    print(f"Wrote a {mode} pep section into {config_path}.")
 
 
 def _generate_keys(config_path: str) -> None:
