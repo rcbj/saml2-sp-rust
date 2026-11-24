@@ -32,6 +32,7 @@ The embedded PEP (#40, iya-sts#1206 work item 8), behind the `pep` feature (`loc
 - `src/pep_test.rs` has its own stub PDP (on `support::serve`, which now records headers) and reuses `ssf_test.rs`'s transmitter. The no-feature refusal is in `sp_test.rs`. The `test` stage runs `cargo test` and then `cargo test --all-features`; the demo image builds with `--features local`.
 - **The dependency is a git dependency on iya-pep-rust's `feature/1`** until that crate's first release. Switch it to the crates.io version then, because crates.io refuses a git dependency at publish.
 - The live test of the PEP waits for iya-sts #2026–#2028.
+- **The user guide is `docs/remote-pep.md`**, generated for the four Rust libraries from one outline; keep its sections in step with the siblings' when changing it. The README's section is a summary that links to it.
 
 ## Layout
 
