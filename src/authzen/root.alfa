@@ -1,0 +1,113 @@
+namespace samlspauthzen {
+    attribute act { category = actionCat id = "urn:oasis:names:tc:xacml:1.0:action:action-id" type = string }
+    attribute rtype { category = resourceCat id = "urn:sts:xacml:authzen:resource-type" type = string }
+    attribute protocol { category = environmentCat id = "urn:sts:xacml:protocol" type = string }
+    attribute acr { category = subjectCat id = "urn:saml-sp:acr" type = string }
+    attribute clearance { category = subjectCat id = "urn:saml-sp:clearance" type = integer }
+    attribute team { category = subjectCat id = "urn:saml-sp:team" type = string }
+    attribute contractor { category = subjectCat id = "urn:saml-sp:contractor" type = boolean }
+    attribute department { category = subjectCat id = "urn:saml-sp:department" type = string }
+    attribute surname { category = subjectCat id = "sn" type = string }
+    attribute sensitivity { category = resourceCat id = "urn:saml-sp:sensitivity" type = double }
+    attribute retainUntil { category = resourceCat id = "urn:saml-sp:retain-until" type = dateTime }
+    attribute ownerRegion { category = resourceCat id = "urn:saml-sp:owner-region" type = string }
+    attribute label { category = resourceCat id = "urn:saml-sp:label" type = string }
+    attribute reason { category = actionCat id = "urn:saml-sp:reason" type = string }
+    attribute channel { category = environmentCat id = "urn:saml-sp:channel" type = string }
+    attribute managed { category = environmentCat id = "urn:saml-sp:device-managed" type = boolean }
+    policyset samlspRoot {
+        id = "urn:saml-sp:authzen:root"
+        apply permitOverrides
+        policy dossiers {
+            id = "urn:saml-sp:authzen:dossiers"
+            apply firstApplicable
+            target clause rtype == "dossier"
+            rule read {
+                permit
+                target clause act == "read"
+                target clause acr == "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport"
+            }
+            rule annotate {
+                permit
+                target clause act == "annotate"
+                target clause clearance >= 3
+            }
+            rule archive {
+                permit
+                target clause act == "archive"
+                target clause sensitivity <= 0.5
+                target clause retainUntil >= dateTime("2026-01-01T00:00:00Z")
+            }
+            rule share {
+                permit
+                target clause act == "share"
+                target clause team == "legal"
+                target clause ownerRegion == "emea"
+            }
+            rule hold {
+                permit
+                target clause act == "hold"
+                target clause label == "litigation"
+                target clause reason == "court-order"
+            }
+            rule export {
+                permit
+                target clause act == "export"
+                target clause channel == "branch"
+                target clause managed == true
+                target clause contractor == false
+            }
+            rule audit {
+                permit
+                target clause act == "audit"
+                target clause surname == "Ledger"
+            }
+            rule budget {
+                permit
+                target clause act == "budget"
+                target clause department == "finance"
+            }
+            rule inspect {
+                permit
+                target clause act == "inspect"
+                target clause protocol == "authzen"
+            }
+            rule tally {
+                permit
+                target clause act == "tally"
+                condition stringOneAndOnly(team) == "legal"
+            }
+            rule approve {
+                permit
+                target clause act == "approve"
+                on permit {
+                    obligation "urn:sts:xacml:authzen:obligation:step-up" {
+                        "acr_value" = "urn:saml-sp:acr:two-factor"
+                    }
+                }
+            }
+            rule notify {
+                permit
+                target clause act == "notify"
+                on permit {
+                    obligation "urn:sts:xacml:authzen:obligation:notification" {
+                        "to" = "records@saml-sp.test"
+                        "body" = "a dossier was shared"
+                    }
+                }
+            }
+            rule list {
+                permit
+                target clause act == "list"
+                on permit {
+                    obligation "urn:sts:xacml:obligation:log" {
+                        "note" = "dossiers listed"
+                    }
+                }
+            }
+            rule otherwise {
+                deny
+            }
+        }
+    }
+}

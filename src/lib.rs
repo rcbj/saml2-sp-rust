@@ -52,3 +52,5 @@ mod configure_test;
 mod trust_chain_test;
 #[cfg(all(test, feature = "pep"))]
 mod pep_test;
+#[cfg(all(test, feature = "local"))]
+mod authzen_test;

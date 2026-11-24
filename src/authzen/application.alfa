@@ -1,0 +1,23 @@
+namespace samlspapplication {
+    attribute act { category = actionCat id = "urn:oasis:names:tc:xacml:1.0:action:action-id" type = string }
+    attribute rtype { category = resourceCat id = "urn:sts:xacml:authzen:resource-type" type = string }
+    attribute stage { category = environmentCat id = "urn:sts:xacml:fga:stage" type = string }
+    policyset samlspApplication {
+        id = "urn:saml-sp:authzen:application"
+        apply denyUnlessPermit
+        policy invoices {
+            id = "urn:saml-sp:authzen:invoices"
+            apply firstApplicable
+            target clause rtype == "invoice"
+            rule view {
+                permit
+                target clause act == "view"
+            }
+            rule pay {
+                permit
+                target clause act == "pay"
+                target clause stage == "access"
+            }
+        }
+    }
+}

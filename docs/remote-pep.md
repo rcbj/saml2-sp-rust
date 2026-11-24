@@ -224,6 +224,15 @@ The receiver then asks its stream for `urn:iya:sts:secevent:event-type:pep-polic
 | Policy changes take minutes to apply (`local`) | The stream doesn't carry the event: check the console's *policy-change events* column, `ssfAllowedEvents` (step 6), and the receiver's logger (`ReceiverOptions::log`, at `error`) for a refused stream update. |
 | The configuration is refused for the assertion key | It is one of this library's own keys. The PEP needs a key of its own. |
 
+## Testing central against local
+
+Both modes must give the same answer to the same question. This library holds itself to that with its own case table, `src/authzen/cases.json`: the catalogue rows and policies it needs, and 45 cases, each a SAML sign-in, an `Access` and the answer your application would see. They cover Permit, Deny and NotApplicable; a missing claim and an undeclared one (dropped); undeclared resource, nested and context members and wrong-typed values (refused, so a Deny); integer, double, boolean and dateTime values, bags and dotted paths; a `context.application` naming another application; a directory attribute from iya-sts's PIP; obligations declared and not; an ended session (`decide_session`); a processing error (Unavailable); and an application that enforces fine-grained authorization, whose policy references another.
+
+- `docker build --target test .` runs the cases through a `local` PEP against a stub PDP serving the table.
+- `IYA_STS_IMAGE=<an iya-sts image> python3 scripts/live_authzen.py` (or `IYA_STS_URL` for a running one) provisions a fresh iya-sts as the steps above describe, with two PEPs, one per mode, and asks every case of both. It fails on any case where central and local differ, or either differs from the table, and prints each one. Its ports are `LIVE_STS_PORT` (18518) and `LIVE_DEMO_PORT` (18618, which only names the SP).
+
+Two cases fail today, both about an application that enforces fine-grained authorization: a rule in a policy the application's policy references (central denies: iya-sts decides the application's policy without its references, while a `local` PEP is sent them) and a rule on `urn:sts:xacml:fga:stage` (local denies: the PEP does not add the two facts iya-sts adds for an application's policy). Until both are fixed, don't rely on either in an application's own policy.
+
 ## The demo
 
 Built with `local` (the Dockerfile does), the demo protects `GET /orders/<id>` with the PEP when `demo/saml.json` has a `pep` section: 401 without a sign-in, 200 on a Permit, 403 on a Deny and 503 on `Unavailable`.

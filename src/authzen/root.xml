@@ -1,0 +1,319 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<PolicySet xmlns="urn:oasis:names:tc:xacml:3.0:core:schema:wd-17" PolicySetId="urn:saml-sp:authzen:root" Version="1.0" PolicyCombiningAlgId="urn:oasis:names:tc:xacml:3.0:policy-combining-algorithm:permit-overrides">
+  <Target/>
+  <Policy PolicyId="urn:saml-sp:authzen:dossiers" Version="1.0" RuleCombiningAlgId="urn:oasis:names:tc:xacml:1.0:rule-combining-algorithm:first-applicable">
+    <Target>
+      <AnyOf>
+        <AllOf>
+          <Match MatchId="urn:oasis:names:tc:xacml:1.0:function:string-equal">
+            <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#string">dossier</AttributeValue>
+            <AttributeDesignator Category="urn:oasis:names:tc:xacml:3.0:attribute-category:resource" AttributeId="urn:sts:xacml:authzen:resource-type" DataType="http://www.w3.org/2001/XMLSchema#string" MustBePresent="false"/>
+          </Match>
+        </AllOf>
+      </AnyOf>
+    </Target>
+    <Rule RuleId="read" Effect="Permit">
+      <Target>
+        <AnyOf>
+          <AllOf>
+            <Match MatchId="urn:oasis:names:tc:xacml:1.0:function:string-equal">
+              <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#string">read</AttributeValue>
+              <AttributeDesignator Category="urn:oasis:names:tc:xacml:3.0:attribute-category:action" AttributeId="urn:oasis:names:tc:xacml:1.0:action:action-id" DataType="http://www.w3.org/2001/XMLSchema#string" MustBePresent="false"/>
+            </Match>
+          </AllOf>
+        </AnyOf>
+        <AnyOf>
+          <AllOf>
+            <Match MatchId="urn:oasis:names:tc:xacml:1.0:function:string-equal">
+              <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#string">urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport</AttributeValue>
+              <AttributeDesignator Category="urn:oasis:names:tc:xacml:1.0:subject-category:access-subject" AttributeId="urn:saml-sp:acr" DataType="http://www.w3.org/2001/XMLSchema#string" MustBePresent="false"/>
+            </Match>
+          </AllOf>
+        </AnyOf>
+      </Target>
+    </Rule>
+    <Rule RuleId="annotate" Effect="Permit">
+      <Target>
+        <AnyOf>
+          <AllOf>
+            <Match MatchId="urn:oasis:names:tc:xacml:1.0:function:string-equal">
+              <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#string">annotate</AttributeValue>
+              <AttributeDesignator Category="urn:oasis:names:tc:xacml:3.0:attribute-category:action" AttributeId="urn:oasis:names:tc:xacml:1.0:action:action-id" DataType="http://www.w3.org/2001/XMLSchema#string" MustBePresent="false"/>
+            </Match>
+          </AllOf>
+        </AnyOf>
+        <AnyOf>
+          <AllOf>
+            <Match MatchId="urn:oasis:names:tc:xacml:1.0:function:integer-less-than-or-equal">
+              <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#integer">3</AttributeValue>
+              <AttributeDesignator Category="urn:oasis:names:tc:xacml:1.0:subject-category:access-subject" AttributeId="urn:saml-sp:clearance" DataType="http://www.w3.org/2001/XMLSchema#integer" MustBePresent="false"/>
+            </Match>
+          </AllOf>
+        </AnyOf>
+      </Target>
+    </Rule>
+    <Rule RuleId="archive" Effect="Permit">
+      <Target>
+        <AnyOf>
+          <AllOf>
+            <Match MatchId="urn:oasis:names:tc:xacml:1.0:function:string-equal">
+              <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#string">archive</AttributeValue>
+              <AttributeDesignator Category="urn:oasis:names:tc:xacml:3.0:attribute-category:action" AttributeId="urn:oasis:names:tc:xacml:1.0:action:action-id" DataType="http://www.w3.org/2001/XMLSchema#string" MustBePresent="false"/>
+            </Match>
+          </AllOf>
+        </AnyOf>
+        <AnyOf>
+          <AllOf>
+            <Match MatchId="urn:oasis:names:tc:xacml:1.0:function:double-greater-than-or-equal">
+              <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#double">0.5</AttributeValue>
+              <AttributeDesignator Category="urn:oasis:names:tc:xacml:3.0:attribute-category:resource" AttributeId="urn:saml-sp:sensitivity" DataType="http://www.w3.org/2001/XMLSchema#double" MustBePresent="false"/>
+            </Match>
+          </AllOf>
+        </AnyOf>
+        <AnyOf>
+          <AllOf>
+            <Match MatchId="urn:oasis:names:tc:xacml:1.0:function:dateTime-less-than-or-equal">
+              <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#dateTime">2026-01-01T00:00:00Z</AttributeValue>
+              <AttributeDesignator Category="urn:oasis:names:tc:xacml:3.0:attribute-category:resource" AttributeId="urn:saml-sp:retain-until" DataType="http://www.w3.org/2001/XMLSchema#dateTime" MustBePresent="false"/>
+            </Match>
+          </AllOf>
+        </AnyOf>
+      </Target>
+    </Rule>
+    <Rule RuleId="share" Effect="Permit">
+      <Target>
+        <AnyOf>
+          <AllOf>
+            <Match MatchId="urn:oasis:names:tc:xacml:1.0:function:string-equal">
+              <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#string">share</AttributeValue>
+              <AttributeDesignator Category="urn:oasis:names:tc:xacml:3.0:attribute-category:action" AttributeId="urn:oasis:names:tc:xacml:1.0:action:action-id" DataType="http://www.w3.org/2001/XMLSchema#string" MustBePresent="false"/>
+            </Match>
+          </AllOf>
+        </AnyOf>
+        <AnyOf>
+          <AllOf>
+            <Match MatchId="urn:oasis:names:tc:xacml:1.0:function:string-equal">
+              <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#string">legal</AttributeValue>
+              <AttributeDesignator Category="urn:oasis:names:tc:xacml:1.0:subject-category:access-subject" AttributeId="urn:saml-sp:team" DataType="http://www.w3.org/2001/XMLSchema#string" MustBePresent="false"/>
+            </Match>
+          </AllOf>
+        </AnyOf>
+        <AnyOf>
+          <AllOf>
+            <Match MatchId="urn:oasis:names:tc:xacml:1.0:function:string-equal">
+              <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#string">emea</AttributeValue>
+              <AttributeDesignator Category="urn:oasis:names:tc:xacml:3.0:attribute-category:resource" AttributeId="urn:saml-sp:owner-region" DataType="http://www.w3.org/2001/XMLSchema#string" MustBePresent="false"/>
+            </Match>
+          </AllOf>
+        </AnyOf>
+      </Target>
+    </Rule>
+    <Rule RuleId="hold" Effect="Permit">
+      <Target>
+        <AnyOf>
+          <AllOf>
+            <Match MatchId="urn:oasis:names:tc:xacml:1.0:function:string-equal">
+              <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#string">hold</AttributeValue>
+              <AttributeDesignator Category="urn:oasis:names:tc:xacml:3.0:attribute-category:action" AttributeId="urn:oasis:names:tc:xacml:1.0:action:action-id" DataType="http://www.w3.org/2001/XMLSchema#string" MustBePresent="false"/>
+            </Match>
+          </AllOf>
+        </AnyOf>
+        <AnyOf>
+          <AllOf>
+            <Match MatchId="urn:oasis:names:tc:xacml:1.0:function:string-equal">
+              <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#string">litigation</AttributeValue>
+              <AttributeDesignator Category="urn:oasis:names:tc:xacml:3.0:attribute-category:resource" AttributeId="urn:saml-sp:label" DataType="http://www.w3.org/2001/XMLSchema#string" MustBePresent="false"/>
+            </Match>
+          </AllOf>
+        </AnyOf>
+        <AnyOf>
+          <AllOf>
+            <Match MatchId="urn:oasis:names:tc:xacml:1.0:function:string-equal">
+              <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#string">court-order</AttributeValue>
+              <AttributeDesignator Category="urn:oasis:names:tc:xacml:3.0:attribute-category:action" AttributeId="urn:saml-sp:reason" DataType="http://www.w3.org/2001/XMLSchema#string" MustBePresent="false"/>
+            </Match>
+          </AllOf>
+        </AnyOf>
+      </Target>
+    </Rule>
+    <Rule RuleId="export" Effect="Permit">
+      <Target>
+        <AnyOf>
+          <AllOf>
+            <Match MatchId="urn:oasis:names:tc:xacml:1.0:function:string-equal">
+              <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#string">export</AttributeValue>
+              <AttributeDesignator Category="urn:oasis:names:tc:xacml:3.0:attribute-category:action" AttributeId="urn:oasis:names:tc:xacml:1.0:action:action-id" DataType="http://www.w3.org/2001/XMLSchema#string" MustBePresent="false"/>
+            </Match>
+          </AllOf>
+        </AnyOf>
+        <AnyOf>
+          <AllOf>
+            <Match MatchId="urn:oasis:names:tc:xacml:1.0:function:string-equal">
+              <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#string">branch</AttributeValue>
+              <AttributeDesignator Category="urn:oasis:names:tc:xacml:3.0:attribute-category:environment" AttributeId="urn:saml-sp:channel" DataType="http://www.w3.org/2001/XMLSchema#string" MustBePresent="false"/>
+            </Match>
+          </AllOf>
+        </AnyOf>
+        <AnyOf>
+          <AllOf>
+            <Match MatchId="urn:oasis:names:tc:xacml:1.0:function:boolean-equal">
+              <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#boolean">true</AttributeValue>
+              <AttributeDesignator Category="urn:oasis:names:tc:xacml:3.0:attribute-category:environment" AttributeId="urn:saml-sp:device-managed" DataType="http://www.w3.org/2001/XMLSchema#boolean" MustBePresent="false"/>
+            </Match>
+          </AllOf>
+        </AnyOf>
+        <AnyOf>
+          <AllOf>
+            <Match MatchId="urn:oasis:names:tc:xacml:1.0:function:boolean-equal">
+              <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#boolean">false</AttributeValue>
+              <AttributeDesignator Category="urn:oasis:names:tc:xacml:1.0:subject-category:access-subject" AttributeId="urn:saml-sp:contractor" DataType="http://www.w3.org/2001/XMLSchema#boolean" MustBePresent="false"/>
+            </Match>
+          </AllOf>
+        </AnyOf>
+      </Target>
+    </Rule>
+    <Rule RuleId="audit" Effect="Permit">
+      <Target>
+        <AnyOf>
+          <AllOf>
+            <Match MatchId="urn:oasis:names:tc:xacml:1.0:function:string-equal">
+              <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#string">audit</AttributeValue>
+              <AttributeDesignator Category="urn:oasis:names:tc:xacml:3.0:attribute-category:action" AttributeId="urn:oasis:names:tc:xacml:1.0:action:action-id" DataType="http://www.w3.org/2001/XMLSchema#string" MustBePresent="false"/>
+            </Match>
+          </AllOf>
+        </AnyOf>
+        <AnyOf>
+          <AllOf>
+            <Match MatchId="urn:oasis:names:tc:xacml:1.0:function:string-equal">
+              <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#string">Ledger</AttributeValue>
+              <AttributeDesignator Category="urn:oasis:names:tc:xacml:1.0:subject-category:access-subject" AttributeId="sn" DataType="http://www.w3.org/2001/XMLSchema#string" MustBePresent="false"/>
+            </Match>
+          </AllOf>
+        </AnyOf>
+      </Target>
+    </Rule>
+    <Rule RuleId="budget" Effect="Permit">
+      <Target>
+        <AnyOf>
+          <AllOf>
+            <Match MatchId="urn:oasis:names:tc:xacml:1.0:function:string-equal">
+              <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#string">budget</AttributeValue>
+              <AttributeDesignator Category="urn:oasis:names:tc:xacml:3.0:attribute-category:action" AttributeId="urn:oasis:names:tc:xacml:1.0:action:action-id" DataType="http://www.w3.org/2001/XMLSchema#string" MustBePresent="false"/>
+            </Match>
+          </AllOf>
+        </AnyOf>
+        <AnyOf>
+          <AllOf>
+            <Match MatchId="urn:oasis:names:tc:xacml:1.0:function:string-equal">
+              <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#string">finance</AttributeValue>
+              <AttributeDesignator Category="urn:oasis:names:tc:xacml:1.0:subject-category:access-subject" AttributeId="urn:saml-sp:department" DataType="http://www.w3.org/2001/XMLSchema#string" MustBePresent="false"/>
+            </Match>
+          </AllOf>
+        </AnyOf>
+      </Target>
+    </Rule>
+    <Rule RuleId="inspect" Effect="Permit">
+      <Target>
+        <AnyOf>
+          <AllOf>
+            <Match MatchId="urn:oasis:names:tc:xacml:1.0:function:string-equal">
+              <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#string">inspect</AttributeValue>
+              <AttributeDesignator Category="urn:oasis:names:tc:xacml:3.0:attribute-category:action" AttributeId="urn:oasis:names:tc:xacml:1.0:action:action-id" DataType="http://www.w3.org/2001/XMLSchema#string" MustBePresent="false"/>
+            </Match>
+          </AllOf>
+        </AnyOf>
+        <AnyOf>
+          <AllOf>
+            <Match MatchId="urn:oasis:names:tc:xacml:1.0:function:string-equal">
+              <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#string">authzen</AttributeValue>
+              <AttributeDesignator Category="urn:oasis:names:tc:xacml:3.0:attribute-category:environment" AttributeId="urn:sts:xacml:protocol" DataType="http://www.w3.org/2001/XMLSchema#string" MustBePresent="false"/>
+            </Match>
+          </AllOf>
+        </AnyOf>
+      </Target>
+    </Rule>
+    <Rule RuleId="tally" Effect="Permit">
+      <Target>
+        <AnyOf>
+          <AllOf>
+            <Match MatchId="urn:oasis:names:tc:xacml:1.0:function:string-equal">
+              <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#string">tally</AttributeValue>
+              <AttributeDesignator Category="urn:oasis:names:tc:xacml:3.0:attribute-category:action" AttributeId="urn:oasis:names:tc:xacml:1.0:action:action-id" DataType="http://www.w3.org/2001/XMLSchema#string" MustBePresent="false"/>
+            </Match>
+          </AllOf>
+        </AnyOf>
+      </Target>
+      <Condition>
+        <Apply FunctionId="urn:oasis:names:tc:xacml:1.0:function:string-equal">
+          <Apply FunctionId="urn:oasis:names:tc:xacml:1.0:function:string-one-and-only">
+            <AttributeDesignator Category="urn:oasis:names:tc:xacml:1.0:subject-category:access-subject" AttributeId="urn:saml-sp:team" DataType="http://www.w3.org/2001/XMLSchema#string" MustBePresent="false"/>
+          </Apply>
+          <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#string">legal</AttributeValue>
+        </Apply>
+      </Condition>
+    </Rule>
+    <Rule RuleId="approve" Effect="Permit">
+      <Target>
+        <AnyOf>
+          <AllOf>
+            <Match MatchId="urn:oasis:names:tc:xacml:1.0:function:string-equal">
+              <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#string">approve</AttributeValue>
+              <AttributeDesignator Category="urn:oasis:names:tc:xacml:3.0:attribute-category:action" AttributeId="urn:oasis:names:tc:xacml:1.0:action:action-id" DataType="http://www.w3.org/2001/XMLSchema#string" MustBePresent="false"/>
+            </Match>
+          </AllOf>
+        </AnyOf>
+      </Target>
+      <ObligationExpressions>
+        <ObligationExpression ObligationId="urn:sts:xacml:authzen:obligation:step-up" FulfillOn="Permit">
+          <AttributeAssignmentExpression AttributeId="acr_value">
+            <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#string">urn:saml-sp:acr:two-factor</AttributeValue>
+          </AttributeAssignmentExpression>
+        </ObligationExpression>
+      </ObligationExpressions>
+    </Rule>
+    <Rule RuleId="notify" Effect="Permit">
+      <Target>
+        <AnyOf>
+          <AllOf>
+            <Match MatchId="urn:oasis:names:tc:xacml:1.0:function:string-equal">
+              <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#string">notify</AttributeValue>
+              <AttributeDesignator Category="urn:oasis:names:tc:xacml:3.0:attribute-category:action" AttributeId="urn:oasis:names:tc:xacml:1.0:action:action-id" DataType="http://www.w3.org/2001/XMLSchema#string" MustBePresent="false"/>
+            </Match>
+          </AllOf>
+        </AnyOf>
+      </Target>
+      <ObligationExpressions>
+        <ObligationExpression ObligationId="urn:sts:xacml:authzen:obligation:notification" FulfillOn="Permit">
+          <AttributeAssignmentExpression AttributeId="to">
+            <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#string">records@saml-sp.test</AttributeValue>
+          </AttributeAssignmentExpression>
+          <AttributeAssignmentExpression AttributeId="body">
+            <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#string">a dossier was shared</AttributeValue>
+          </AttributeAssignmentExpression>
+        </ObligationExpression>
+      </ObligationExpressions>
+    </Rule>
+    <Rule RuleId="list" Effect="Permit">
+      <Target>
+        <AnyOf>
+          <AllOf>
+            <Match MatchId="urn:oasis:names:tc:xacml:1.0:function:string-equal">
+              <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#string">list</AttributeValue>
+              <AttributeDesignator Category="urn:oasis:names:tc:xacml:3.0:attribute-category:action" AttributeId="urn:oasis:names:tc:xacml:1.0:action:action-id" DataType="http://www.w3.org/2001/XMLSchema#string" MustBePresent="false"/>
+            </Match>
+          </AllOf>
+        </AnyOf>
+      </Target>
+      <ObligationExpressions>
+        <ObligationExpression ObligationId="urn:sts:xacml:obligation:log" FulfillOn="Permit">
+          <AttributeAssignmentExpression AttributeId="note">
+            <AttributeValue DataType="http://www.w3.org/2001/XMLSchema#string">dossiers listed</AttributeValue>
+          </AttributeAssignmentExpression>
+        </ObligationExpression>
+      </ObligationExpressions>
+    </Rule>
+    <Rule RuleId="otherwise" Effect="Deny">
+      <Target/>
+    </Rule>
+  </Policy>
+</PolicySet>
