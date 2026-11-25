@@ -64,7 +64,10 @@ pub struct ReceiverOptions {
     /// Tell the transmitter which subjects this receiver cares about (SSF 1.0
     /// Add Subject / Remove Subject): add a signed-in person's identifiers
     /// when `track` starts a session, remove them when the last local session
-    /// for them ends. Default `true` (`ssf.addSubjects` in a configuration
+    /// for them ends. With `pep` (a PEP that wants policy events), the
+    /// application (`{format: opaque, id}`) is added at `start` and never
+    /// removed, so `pep-policies-changed` still reaches a stream that names
+    /// people. Default `true` (`ssf.addSubjects` in a configuration
     /// file; [`ssf_add_subjects`] reads it). Without the transmitter's
     /// `add_subject_endpoint` / `remove_subject_endpoint` nothing is sent.
     pub add_subjects: bool,
@@ -344,6 +347,8 @@ impl SignalsReceiver {
             }
             let subject = if call.format == "email" {
                 json!({"format": "email", "email": call.value})
+            } else if call.format == "opaque" {
+                json!({"format": "opaque", "id": call.value})
             } else {
                 json!({"format": "iss_sub", "iss": issuer, "sub": call.value})
             };
@@ -422,6 +427,22 @@ impl SignalsReceiver {
             }
             self.inner.state.lock().expect("state").stream = stream.clone();
             sched.running = true;
+        }
+        // A transmitter narrows a stream that names subjects to those subjects
+        // (iya-sts, #2234; SSF 1.0 8.1.3), and `pep-policies-changed` is about
+        // the application the PEP is embedded in: a complex subject whose
+        // `application` member is {format: opaque, id: <application>}. Once
+        // people are added the stream would stop carrying it, so a receiver
+        // whose PEP wants events names the application first, at start, and
+        // never removes it.
+        #[cfg(feature = "pep")]
+        if self.inner.add_subjects {
+            if let Some(pep) = &self.inner.pep {
+                let application = pep.config().application.clone();
+                if !application.is_empty() {
+                    self.inner.subject_calls.lock().expect("subject calls").insert(0, SubjectCall { add: true, format: "opaque", value: application });
+                }
+            }
         }
         let delivered = stream.get("events_delivered").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
         let stream_id = string_of(stream.get("stream_id").unwrap_or(&Value::Null));

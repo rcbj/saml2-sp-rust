@@ -535,3 +535,53 @@ fn a_section_without_a_mode_is_local() {
     let sp = create(json!({"pep": section})).unwrap();
     assert_eq!(sp.pep().unwrap().status().mode, crate::pep::Mode::Local);
 }
+
+/// A stream that names subjects carries only events about them (iya-sts
+/// #2234), and `pep-policies-changed` is about the application: a receiver
+/// that adds people names the application too, at `start`, first, and never
+/// removes it.
+#[test]
+fn a_receiver_adding_subjects_names_the_application_its_pep_hears_about() {
+    let pdp = start_pdp();
+    let tx = start_transmitter(false);
+    let local = create(json!({"pep": pep_section(&pdp, "subjects", json!({"mode": "local"}))})).unwrap();
+    let options = |pep, add_subjects| ReceiverOptions {
+        transmitter: tx.url.clone(),
+        on_end_sessions: Some(Arc::new(|_: &[String], _: &crate::SignalEvent| Ok(()))),
+        poll_interval_ms: 60_000,
+        log: Some(Arc::new(Quiet)),
+        add_subjects,
+        pep,
+        ..ReceiverOptions::default()
+    };
+    let receiver = SignalsReceiver::new(options(local.pep().cloned(), true)).unwrap();
+    receiver.start().unwrap();
+    receiver.stop();
+    let application = ("add".to_string(), "opaque".to_string(), SP_ENTITY.to_string());
+    assert_eq!(tx.subject_calls(), vec![application.clone()], "named at start");
+    let body = tx.state.lock().unwrap().subject_calls[0].1.clone();
+    assert_eq!(body, json!({"stream_id": "s1", "subject": {"format": "opaque", "id": SP_ENTITY}, "verified": true}));
+    let mut person = login();
+    person.attributes.insert(crate::DEFAULT_SUBJECT_ATTRIBUTE.into(), vec!["urn:uuid:alice".into()]);
+    receiver.track("L1", &person, None);
+    receiver.untrack("L1");
+    receiver.poll_once().unwrap();
+    let calls = tx.subject_calls();
+    assert!(calls.iter().any(|c| c.0 == "add" && c.1 == "iss_sub") && calls.iter().any(|c| c.0 == "remove" && c.1 == "iss_sub"), "{calls:?}");
+    assert!(!calls.iter().any(|c| c.0 == "remove" && c.1 == "opaque"), "the application is never removed: {calls:?}");
+    assert_eq!(calls.iter().filter(|c| **c == application).count(), 1);
+
+    // Switched off, or a PEP that wants no events (central without a Permit
+    // cache): the application is not named.
+    let before = tx.subject_calls().len();
+    let off = SignalsReceiver::new(options(local.pep().cloned(), false)).unwrap();
+    off.start().unwrap();
+    off.stop();
+    off.poll_once().unwrap();
+    let central = create(json!({"pep": pep_section(&pdp, "subjects-central", json!({}))})).unwrap();
+    let quiet = SignalsReceiver::new(options(central.pep().cloned(), true)).unwrap();
+    quiet.start().unwrap();
+    quiet.stop();
+    quiet.poll_once().unwrap();
+    assert_eq!(tx.subject_calls().len(), before, "{:?}", tx.subject_calls());
+}

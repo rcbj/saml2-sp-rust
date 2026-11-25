@@ -31,7 +31,7 @@ impl Logger for Collecting {
     fn error(&self, message: &str) { self.errors.lock().unwrap().push(message.to_string()); }
 }
 
-struct TxState {
+pub(crate) struct TxState {
     queue: HashMap<String, String>,
     acked: Vec<String>,
     errs: Map<String, Value>,
@@ -46,7 +46,7 @@ struct TxState {
     entered: Arc<(Mutex<bool>, std::sync::Condvar)>,
     held_once: bool,
     /// Every Add/Remove Subject call: ("add" or "remove", its body).
-    subject_calls: Vec<(String, Value)>,
+    pub(crate) subject_calls: Vec<(String, Value)>,
     /// The status Add Subject answers (0: 204).
     add_status: u16,
     /// Whether the metadata publishes add_subject_endpoint and remove_subject_endpoint.
@@ -58,7 +58,7 @@ struct TxState {
 pub(crate) struct Transmitter {
     server: TestServer,
     pub(crate) url: String,
-    state: Arc<Mutex<TxState>>,
+    pub(crate) state: Arc<Mutex<TxState>>,
 }
 
 impl Transmitter {
@@ -85,11 +85,11 @@ impl Transmitter {
     }
 
     /// The Add/Remove Subject calls so far, as ("add"|"remove", format, value).
-    fn subject_calls(&self) -> Vec<(String, String, String)> {
+    pub(crate) fn subject_calls(&self) -> Vec<(String, String, String)> {
         self.state.lock().unwrap().subject_calls.iter().map(|(kind, body)| {
             let subject = &body["subject"];
             let format = subject["format"].as_str().unwrap_or("").to_string();
-            let value = if format == "email" { subject["email"].clone() } else { subject["sub"].clone() };
+            let value = match format.as_str() { "email" => subject["email"].clone(), "opaque" => subject["id"].clone(), _ => subject["sub"].clone() };
             (kind.clone(), format, value.as_str().unwrap_or("").to_string())
         }).collect()
     }
