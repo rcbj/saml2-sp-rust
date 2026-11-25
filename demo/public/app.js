@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Iya CyberSecurity Solutions, LLC
 // SPDX-License-Identifier: MIT
-//
 // The signed-in page's one script. It shows the Shared Signals events about THIS session, live:
 //
 //   - an EventSource on /events receives each event as JSON the moment the server's receiver has it,
@@ -15,7 +14,10 @@
 // link here are that account's, and the server only ever sends them events about that account's session
 // or person, so nothing here filters. Another account in the same browser has its own tabs and streams.
 // Everything an event carries is identity provider data and is drawn with textContent, never as HTML.
-
+// Its own scope: every page script shares one global scope, and two
+// top-level declarations of one name (app.js and pep.js both had `panel`)
+// make the second script fail to load at all.
+(() => {
 const panel = document.getElementById('panel');
 const log = document.getElementById('log');
 const logEmpty = document.getElementById('log-empty');
@@ -150,3 +152,4 @@ document.getElementById('verify-form')?.addEventListener('submit', async (ev) =>
 });
 
 listen();
+})();

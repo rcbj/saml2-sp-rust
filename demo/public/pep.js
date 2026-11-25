@@ -7,6 +7,10 @@
 // is a <details> with a stable id. The server escapes everything in the
 // fragment. A hidden page does not poll, and a 401 means the session is gone,
 // so the browser goes back to the sign-in page.
+// Its own scope: every page script shares one global scope, and two
+// top-level declarations of one name (app.js and pep.js both had `panel`)
+// make the second script fail to load at all.
+(() => {
 const pane = document.getElementById('pep-panel');
 const EVERY_MS = 2000;
 
@@ -25,6 +29,8 @@ async function redraw() {
       const again = document.getElementById(id);
       if (again) again.open = false;
     });
+    // The Collapse all / Expand all toggle reads the panes again.
+    document.dispatchEvent(new Event('panes-redrawn'));
   } catch (err) {
     // The demo restarting: keep what is shown, and try on the next tick.
   }
@@ -34,3 +40,4 @@ if (pane) {
   setInterval(redraw, EVERY_MS);
   document.addEventListener('visibilitychange', redraw);
 }
+})();
