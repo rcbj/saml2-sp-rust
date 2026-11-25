@@ -148,6 +148,10 @@ struct Inner {
     /// whether the stream does.
     #[cfg(feature = "pep")]
     pep: Option<Arc<crate::pep::Pep>>,
+    /// What the stream carries for the PEP (`requested` or `excluded`), once
+    /// `start` knows: a failed poll reports `down`, and the next good one this.
+    #[cfg(feature = "pep")]
+    pep_stream: Mutex<Option<crate::pep::EventStream>>,
     state: Mutex<State>,
     sched: Mutex<Sched>,
     gate: Gate,
@@ -212,6 +216,8 @@ impl SignalsReceiver {
                 log,
                 #[cfg(feature = "pep")]
                 pep: event_pep,
+                #[cfg(feature = "pep")]
+                pep_stream: Mutex::new(None),
                 state: Mutex::new(State {
                     config: Map::new(),
                     stream: Map::new(),
@@ -274,7 +280,9 @@ impl SignalsReceiver {
         if let Some(pep) = &self.inner.pep {
             let carries = |name: &str| stream.get(name).and_then(Value::as_array).map(|list| list.iter().any(|v| v.as_str() == Some(crate::pep::POLICIES_CHANGED_EVENT)));
             let carried = carries("events_delivered").or_else(|| carries("events_requested")).unwrap_or(true);
-            pep.set_event_stream(if carried { crate::pep::EventStream::Requested } else { crate::pep::EventStream::Excluded });
+            let state = if carried { crate::pep::EventStream::Requested } else { crate::pep::EventStream::Excluded };
+            pep.set_event_stream(state);
+            *self.inner.pep_stream.lock().expect("pep stream") = Some(state);
         }
         let endpoint = stream.get("delivery").and_then(|d| d.get("endpoint_url")).and_then(|v| v.as_str()).unwrap_or("");
         if endpoint.is_empty() {
@@ -303,6 +311,23 @@ impl SignalsReceiver {
             sched.generation += 1;
         }
         self.inner.gate.wait();
+        // A stopped receiver hears nothing: the PEP polls its own policies.
+        #[cfg(feature = "pep")]
+        if let Some(pep) = &self.inner.pep {
+            pep.set_event_stream(crate::pep::EventStream::Down);
+        }
+    }
+
+    /// The PEP's view of the stream follows the polls: `down` while they
+    /// fail (it polls its own policies instead), and what the stream carries
+    /// again once one succeeds.
+    #[cfg(feature = "pep")]
+    fn report_pep_stream(&self, ok: bool) {
+        let Some(pep) = &self.inner.pep else { return };
+        let state = if ok { *self.inner.pep_stream.lock().expect("pep stream") } else { Some(crate::pep::EventStream::Down) };
+        if let Some(state) = state {
+            pep.set_event_stream(state);
+        }
     }
 
     fn iteration(&self) {
@@ -367,6 +392,8 @@ impl SignalsReceiver {
             return slot.clone().unwrap();
         }
         let result = self.poll_now();
+        #[cfg(feature = "pep")]
+        self.report_pep_stream(result.is_ok());
         let flight = self.inner.sched.lock().expect("sched").inflight.clone();
         if let Some(flight) = flight {
             let mut slot = flight.result.lock().expect("flight");

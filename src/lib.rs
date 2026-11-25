@@ -35,7 +35,7 @@ pub use metadata::{metadata_document, read_idp_metadata, IdpMetadata};
 pub use provider::{AcsBody, LoginOptions, LoginRequest, ServiceProvider};
 pub use receiver::{Logger, ReceiverOptions, SignalEvent, SignalsReceiver};
 pub use replay::MemoryReplayCache;
-pub use response::SamlLogin;
+pub use response::{SamlLogin, USERNAME_ATTRIBUTES};
 pub use session::{tracked_from, MemorySessionIndex, SessionRecord, DEFAULT_SUBJECT_ATTRIBUTE};
 
 #[cfg(test)]

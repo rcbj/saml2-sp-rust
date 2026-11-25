@@ -40,6 +40,8 @@ struct TxState {
     /// Every PATCH body, and whether PATCH is refused (405).
     patches: Vec<Value>,
     refuse_patch: bool,
+    /// When not 0, every poll is answered with this status (a transmitter down).
+    poll_status: u16,
     hold: Option<Arc<(Mutex<bool>, std::sync::Condvar)>>,
     entered: Arc<(Mutex<bool>, std::sync::Condvar)>,
     held_once: bool,
@@ -69,6 +71,11 @@ impl Transmitter {
         self.state.lock().unwrap().refuse_patch = true;
     }
 
+    /// Every poll answers `status` from now on (0: answer normally again).
+    pub(crate) fn poll_status(&self, status: u16) {
+        self.state.lock().unwrap().poll_status = status;
+    }
+
     pub(crate) fn put_set(&self, event_type: &str, sub_id: Value, extra: Map<String, Value>, key: Option<&rsa::RsaPrivateKey>, aud: &str, iss: &str) -> String {
         let key = key.unwrap_or(tx_key());
         let aud = if aud.is_empty() { "my-app" } else { aud };
@@ -96,7 +103,7 @@ fn new_jti() -> String { crate::artifact::new_id().trim_start_matches('_').to_st
 pub(crate) fn start_transmitter(hold: bool) -> Transmitter {
     let state = Arc::new(Mutex::new(TxState {
         queue: HashMap::new(), acked: Vec::new(), errs: Map::new(), streams: Vec::new(), created: 0,
-        patches: Vec::new(), refuse_patch: false,
+        patches: Vec::new(), refuse_patch: false, poll_status: 0,
         hold: if hold { Some(Arc::new((Mutex::new(true), std::sync::Condvar::new()))) } else { None },
         entered: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
         held_once: false,
@@ -155,6 +162,10 @@ pub(crate) fn start_transmitter(hold: bool) -> Transmitter {
             return write(201, stream);
         }
         if req.path.starts_with("/ssf/poll/") {
+            let failing = shared.lock().unwrap().poll_status;
+            if failing != 0 {
+                return write(failing, json!({"err": "down"}));
+            }
             let hold = shared.lock().unwrap().hold.clone();
             let entered = shared.lock().unwrap().entered.clone();
             let first = {

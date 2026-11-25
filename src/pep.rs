@@ -34,15 +34,13 @@ use crate::response::SamlLogin;
 
 pub use iya_pep::{Access, Decision, EventStream, Mode, Obligation, Pep, PepConfig, Status, Subject, POLICIES_CHANGED_EVENT};
 
-/// The attributes the subject's id is read from, in order. iya-sts's
-/// assertions carry the username under all three (`saml/saml2_sso.ts`
-/// `attributesFor()`): the X.500/LDAP profile's `uid` OID, the bare `uid`, and
-/// the AD FS `name` claim. The username is what the service's PIP resolves.
-pub const SUBJECT_ID_ATTRIBUTES: &[&str] = &[
-    "urn:oid:0.9.2342.19200300.100.1.1",
-    "uid",
-    "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name",
-];
+/// The attributes the subject's id is read from, in order
+/// ([`crate::USERNAME_ATTRIBUTES`]): `username`, else `preferred_username`,
+/// else iya-sts's spellings, which carry the username under all three
+/// (`saml/saml2_sso.ts` `attributesFor()`): the X.500/LDAP profile's `uid`
+/// OID, the bare `uid`, and the AD FS `name` claim. The username is what the
+/// service's PIP resolves.
+pub const SUBJECT_ID_ATTRIBUTES: &[&str] = crate::response::USERNAME_ATTRIBUTES;
 
 /// Attributes that carry the authentication methods, read as `amr`.
 const AMR_ATTRIBUTES: &[&str] = &["amr", "http://schemas.microsoft.com/claims/authnmethodsreferences"];
@@ -117,8 +115,7 @@ fn rsa_jwk(key: &rsa::RsaPrivateKey) -> Value {
 /// `amr`, and `AuthnInstant` is `auth_time` in epoch seconds. The PEP sends
 /// only the properties the realm's AuthZEN catalogue declares.
 pub fn subject_of(login: &SamlLogin) -> Subject {
-    let first = |name: &str| login.attributes.get(name).and_then(|v| v.iter().find(|s| !s.is_empty())).cloned();
-    let id = SUBJECT_ID_ATTRIBUTES.iter().find_map(|name| first(name)).unwrap_or_else(|| login.name_id.clone());
+    let id = login.username().map(str::to_string).unwrap_or_else(|| login.name_id.clone());
     let mut properties = Map::new();
     let mut names: Vec<&String> = login.attributes.keys().collect();
     names.sort();

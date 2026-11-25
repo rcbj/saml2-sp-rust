@@ -34,6 +34,32 @@ pub struct SamlLogin {
     pub assertion_id: String,
 }
 
+/// The attributes a username is read from, in order: a `username` attribute,
+/// else `preferred_username` (as oidc-caep-risc reads its claims), else
+/// iya-sts's own spellings (`saml/saml2_sso.ts` `attributesFor()`): the
+/// X.500/LDAP profile's `uid` OID, the bare `uid`, and the AD FS `name`
+/// claim.
+pub const USERNAME_ATTRIBUTES: &[&str] = &[
+    "username",
+    "preferred_username",
+    "urn:oid:0.9.2342.19200300.100.1.1",
+    "uid",
+    "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name",
+];
+
+impl SamlLogin {
+    /// The username: the first non-empty value of the first of
+    /// [`USERNAME_ATTRIBUTES`] the assertion carries, or `None` when it
+    /// carries none (the NameID is then all there is, and it isn't always a
+    /// username: a `transient` one is a per-session handle).
+    pub fn username(&self) -> Option<&str> {
+        USERNAME_ATTRIBUTES
+            .iter()
+            .find_map(|name| self.attributes.get(*name).and_then(|values| values.iter().find(|v| !v.is_empty())))
+            .map(String::as_str)
+    }
+}
+
 pub(crate) struct Received {
     pub xml: String,
     pub binding: String,

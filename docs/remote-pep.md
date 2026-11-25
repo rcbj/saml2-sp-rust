@@ -175,7 +175,7 @@ match sp.decide_session(&receiver.session_index(), &local_id, &login, &access) {
 
 **The subject** comes from the sign-in, never from a request header:
 
-- **id:** the first of `urn:oid:0.9.2342.19200300.100.1.1`, `uid` and `http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name` the assertion carries (iya-sts sends the username under all three), else the NameID. A transient NameID names nobody the PIP can resolve.
+- **id:** the username: the first of `username`, `preferred_username`, `urn:oid:0.9.2342.19200300.100.1.1`, `uid` and `http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name` the assertion carries (iya-sts sends the username under the last three), else the NameID. iya-sts's PIP resolves a username, a DN or a certificate subject; a transient NameID names nobody it can resolve. `SamlLogin::username()` answers the same.
 - **properties:** the attributes (by Name, and by FriendlyName), `AuthnContextClassRef` as `acr`, an `amr` attribute as `amr`, and `AuthnInstant` as `auth_time` in epoch seconds.
 
 Only the properties the catalogue declares are sent.
@@ -204,7 +204,7 @@ let receiver = SignalsReceiver::new(ReceiverOptions {
 })?;
 ```
 
-The receiver then asks its stream for `urn:iya:sts:secevent:event-type:pep-policies-changed`, verifies each SET like every other one, and hands the event to the PEP. A stream that already exists (made before the `pep` section was added, or while the PEP was `central`) is updated with `PATCH` to ask for the event too; if the transmitter refuses, the receiver still starts, the refusal goes to the receiver's logger (`ReceiverOptions::log`, at `error`), and the PEP's heartbeat reports the event as `excluded`. The event is only a hint: the PEP pulls with its own credential and never trusts the event's contents. An event naming another PEP is ignored.
+The receiver then asks its stream for `urn:iya:sts:secevent:event-type:pep-policies-changed`, verifies each SET like every other one, and hands the event to the PEP. A stream that already exists (made before the `pep` section was added, or while the PEP was `central`) is updated with `PATCH` to ask for the event too; if the transmitter refuses, the receiver still starts, the refusal goes to the receiver's logger (`ReceiverOptions::log`, at `error`), and the PEP's heartbeat reports the event as `excluded`. The event is only a hint: the PEP pulls with its own credential and never trusts the event's contents. An event naming another PEP is ignored. The receiver also tells the PEP how its stream is doing: what the stream carries (`requested` or `excluded`) at start and after each good poll, and `down` after a failed poll and on `stop()`, so a `local` PEP polls its own policies while it cannot hear.
 
 ## Operate it
 
