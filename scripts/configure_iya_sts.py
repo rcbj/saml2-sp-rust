@@ -56,19 +56,35 @@ PEP_KEY = "generated/pep-key.pem"
 PEP_GROUP = "remote-peps"
 PEP_EVENT = "urn:iya:sts:secevent:event-type:pep-policies-changed"
 ACR_ATTRIBUTE = "urn:saml-sp-demo:acr"
+# The demo's attribute-protected resource (GET /attribute-protected): the test user carries a custom
+# directory attribute, and the demo application's own policy permits the resource only to a person
+# whose attr1 is abc123. The PEP asks iya-sts's PIP for it (POST /xacml/pip): it is a directory
+# attribute, not something the assertion carries.
+TEST_ATTRIBUTE = "attr1"
+TEST_ATTRIBUTE_VALUE = "abc123"
+TEST_ATTRIBUTE_ID = "urn:sts:xacml:attribute:" + TEST_ATTRIBUTE
+ATTRIBUTE_PROTECTED = "attribute-protected"
+# The PolicyIds of the policies this script writes. While the demo application enforces one of
+# these, a run writes the current version over it; a policy an administrator wrote under another
+# PolicyId is left alone.
+OWN_POLICY_IDS = ("urn:saml-sp-demo:samlspdemo:orders",)
 
 
 def orders_policy(namespace: str = "samlspdemo", read_effect: str = "permit") -> str:
-    """The demo application's own policy, in ALFA: `read` on an `order` is `read_effect`, and
-    everything else (the demo's `write`) is denied. A Permit also needs the sign-in's
-    AuthnContextClassRef, which reaches the policy only through the catalogue row, so a 200 shows
-    the claim arrived."""
+    """The demo application's own policy, in ALFA, the one its fine-grained authorization decisions
+    are made with:
+    - `read` on an `order` is `read_effect`; a Permit also needs the sign-in's AuthnContextClassRef,
+      which reaches the policy only through the catalogue row, so a 200 shows the claim arrived;
+    - `read` on the `attribute-protected` resource is permitted when the person's directory
+      attribute attr1 is abc123, which the PEP asks iya-sts's PIP for;
+    - everything else (the demo's `write`) is denied."""
     needs_acr = "                condition integerGreaterThan(stringBagSize(acr), 0)\n" if read_effect == "permit" else ""
     return (
         f"namespace {namespace} {{\n"
         '    attribute action { category = actionCat id = "urn:oasis:names:tc:xacml:1.0:action:action-id" type = string }\n'
         '    attribute kind { category = resourceCat id = "urn:sts:xacml:authzen:resource-type" type = string }\n'
         f'    attribute acr {{ category = subjectCat id = "{ACR_ATTRIBUTE}" type = string }}\n'
+        f'    attribute {TEST_ATTRIBUTE} {{ category = subjectCat id = "{TEST_ATTRIBUTE_ID}" type = string }}\n'
         f"    policy {namespace}Orders {{\n"
         f'        id = "urn:saml-sp-demo:{namespace}:orders"\n'
         "        apply firstApplicable\n"
@@ -77,6 +93,12 @@ def orders_policy(namespace: str = "samlspdemo", read_effect: str = "permit") ->
         '            target clause action == "read"\n'
         '            target clause kind == "order"\n'
         f"{needs_acr}"
+        "        }\n"
+        "        rule readAttributeProtected {\n"
+        "            permit\n"
+        '            target clause action == "read"\n'
+        f'            target clause kind == "{ATTRIBUTE_PROTECTED}"\n'
+        f'            target clause {TEST_ATTRIBUTE} == "{TEST_ATTRIBUTE_VALUE}"\n'
         "        }\n"
         "        rule nothingElse {\n"
         "            deny\n"
@@ -332,7 +354,56 @@ def plan_for(files: DemoFiles, base: str, test_user: str, sp_metadata_xml: str) 
         calls[-1:-1] = ssf_calls(files, base, "<the SP certificate>")
     if test_user:
         calls.append({"method": "POST", "path": f"{base}/admin-api/users/create", "why": f"create the test user {test_user}", "body": {"username": test_user}})
+        calls.append({"method": "POST", "path": f"{base}/admin-api/policies/define-person-attribute",
+                      "why": f"define the realm's custom attribute {TEST_ATTRIBUTE} (unless it is), with an admin:security token",
+                      "body": define_attribute_body()})
+        calls.append({"method": "POST", "path": f"{base}/admin-api/users/set-attribute",
+                      "why": f"give {test_user} {TEST_ATTRIBUTE}={TEST_ATTRIBUTE_VALUE}",
+                      "body": {"user": test_user, "attribute": TEST_ATTRIBUTE, "value": TEST_ATTRIBUTE_VALUE}})
     return calls
+
+
+def define_attribute_body() -> dict:
+    return {"name": TEST_ATTRIBUTE, "label": "Attribute 1", "syntax": "string", "multiValued": False,
+            "description": "The demo's attribute-protected resource is permitted when this is abc123."}
+
+
+def set_test_attribute(call, user: str) -> bool:
+    """The realm's custom attribute attr1, and the test user's value of it, which
+    GET /attribute-protected is decided on. `call(path, body, security)` answers
+    {"status", "body"} and never stops the script on a refusal.
+
+    Defining a custom attribute changes the realm's attribute policy, a Security Administrator's
+    change: it needs a token carrying admin:security whose subject holds SECURITY_ADMIN. iya-sts
+    seeds sts-api-client in that role, so the definition goes with a token minted for that call
+    alone (`security`). Where an operator took the client out of the role, iya-sts issues the token
+    without the scope and refuses the definition. That is not fatal: the value is tried anyway (the
+    attribute may be defined already), and only when it is refused too does the script say what a
+    Security Administrator does instead. Answers whether the test user now holds the value."""
+    defined = call("/policies/define-person-attribute", define_attribute_body(), True)
+    body = defined["body"] if isinstance(defined["body"], dict) else {}
+    words = (" ".join(_errors_of(body)) + " " + str(body.get("error_description") or body.get("error") or "")).lower()
+    not_allowed = defined["status"] in (401, 403) or "security administrator" in words or "insufficient_scope" in words
+    if not not_allowed and not (defined["status"] == 200 and body.get("ok") is not False):
+        if "already" not in words and "exists" not in words:
+            raise SystemExit(f"defining the custom attribute {TEST_ATTRIBUTE}: refused ({defined['status']}): {json.dumps(body)[:400]}")
+    answered = call("/users/set-attribute", {"user": user, "attribute": TEST_ATTRIBUTE, "value": TEST_ATTRIBUTE_VALUE}, False)
+    reply = answered["body"] if isinstance(answered["body"], dict) else {}
+    if answered["status"] == 200 and reply.get("ok") is not False:
+        print(f"{user} has {TEST_ATTRIBUTE}={TEST_ATTRIBUTE_VALUE} (a custom attribute of the realm).")
+        return True
+    if not_allowed:
+        # Only now does the refusal matter: the attribute is not defined, and this credential
+        # cannot define it.
+        print(f"The custom attribute {TEST_ATTRIBUTE} is not defined, and this credential cannot define it:")
+        print("sts-api-client no longer holds SECURITY_ADMIN here (iya-sts seeds it there; an operator took it")
+        print("out). Put it back on Roles, or sign in to the console as a Security Administrator")
+        print("(the bootstrap administrator is), open Directory > Policies > Attribute policy > Custom")
+        print(f"attributes, and add {TEST_ATTRIBUTE} (label \"Attribute 1\", syntax string, one value). Then run")
+        print(f"this script again to give {user} {TEST_ATTRIBUTE}={TEST_ATTRIBUTE_VALUE}.")
+    else:
+        print(f"{user} does not have {TEST_ATTRIBUTE} yet: {' '.join(_errors_of(reply))[:300]}")
+    return False
 
 
 def ssf_calls(files: DemoFiles, base: str, certificate_pem: str) -> list[dict]:
@@ -388,7 +459,7 @@ def _request(url: str, method: str, headers: dict, body: bytes | None, ca: str |
         return err.code, err.read()
 
 
-def _json(url: str, ca: str | None, method: str = "GET", headers: dict | None = None, body: str | None = None) -> dict:
+def _json(url: str, ca: str | None, method: str = "GET", headers: dict | None = None, body: str | None = None, refuse_denied: bool = True) -> dict:
     raw_headers = dict(headers or {})
     payload = None if body is None else body.encode()
     status, data = _request(url, method, raw_headers, payload, ca)
@@ -397,7 +468,7 @@ def _json(url: str, ca: str | None, method: str = "GET", headers: dict | None = 
         parsed = json.loads(text) if text else {}
     except json.JSONDecodeError as err:
         raise SystemExit(f"{method} {url} answered {status} with non-JSON: {text[:300]}") from err
-    if status in (401, 403):
+    if refuse_denied and status in (401, 403):
         raise SystemExit(f"{method} {url} answered {status}: {json.dumps(parsed)[:300]}")
     return {"status": status, "body": parsed}
 
@@ -406,8 +477,8 @@ def _errors_of(body: dict) -> list[str]:
     return [str(item) for item in (body.get("errors") or [])]
 
 
-def mint_admin_token(origin: str, base: str, ca: str | None, secret: str) -> str:
-    form = urllib.parse.urlencode({"grant_type": "client_credentials", "scope": "admin:read admin:write", "resource": f"{base}/admin-api"})
+def mint_admin_token(origin: str, base: str, ca: str | None, secret: str, scope: str = "admin:read admin:write") -> str:
+    form = urllib.parse.urlencode({"grant_type": "client_credentials", "scope": scope, "resource": f"{base}/admin-api"})
     basic = base64.b64encode(f"sts-api-client:{secret}".encode()).decode()
     reply = _json(f"{base}/oauth2/token", ca, "POST", {"content-type": "application/x-www-form-urlencoded", "authorization": f"Basic {basic}"}, form)
     token = reply["body"].get("access_token") if isinstance(reply["body"], dict) else None
@@ -478,6 +549,23 @@ def main(argv: list[str] | None = None) -> None:
         return _json(f"{base}/admin-api{path}", ca, "POST", {
             "accept": "application/json", "content-type": "application/json", "authorization": f"Bearer {token}",
         }, json.dumps(body))
+
+    security_token: list[str] = []
+
+    def call(path: str, body, security: bool = False) -> dict:
+        # A change iya-sts counts as security (a Directory > Policies policy, such as the realm's
+        # custom attributes) needs admin:security, held through SECURITY_ADMIN, which iya-sts seeds
+        # sts-api-client in. That token is minted only when such a call is made, and used for it
+        # alone; every other call carries admin:read and admin:write. A refusal is answered, not
+        # raised: set_test_attribute decides what it means.
+        bearer = token
+        if security:
+            if not security_token:
+                security_token.append(mint_admin_token(origin, base, ca, secret, "admin:read admin:security"))
+            bearer = security_token[0]
+        return _json(f"{base}/admin-api{path}", ca, "POST", {
+            "accept": "application/json", "content-type": "application/json", "authorization": f"Bearer {bearer}",
+        }, json.dumps(body), refuse_denied=False)
 
     create, upload = plan_for(files, base, args.test_user, sp_metadata_xml)[:2]
     created = api("/applications/create", create["body"])
@@ -561,11 +649,12 @@ def main(argv: list[str] | None = None) -> None:
                     os.fchmod(out.fileno(), 0o600)
                     out.write(f"{made['body']['password']}\n")
                 print(f"Generated a password for {args.test_user}; it is in {saved} (readable by you only).")
+        set_test_attribute(call, args.test_user)
     if args.pep:
         def get(path: str) -> dict:
             return _json(f"{base}/admin-api{path}", ca, "GET", {"accept": "application/json", "authorization": f"Bearer {token}"})
         setup_pep(api, get, files, args.config, args.pep_name, args.pep)
-        print(f"pep: {args.pep_name}, {args.pep} (GET /orders/42 needs a sign-in; any other method is denied)")
+        print(f"pep: {args.pep_name}, {args.pep} (GET /orders/42 and GET /{ATTRIBUTE_PROTECTED} need a sign-in; any other method is denied)")
     print("Done. Start the demo with: docker compose up --build")
 
 
@@ -581,7 +670,7 @@ def pep_plan(files: DemoFiles, base: str, name: str, mode: str) -> list[str]:
         f"POST {base}/admin-api/xacml/set-pep-application  # or, with both kept, bind {name} to {app} again",
         f"POST {base}/admin-api/xacml/authzen/set-attribute  # subject.acr -> {ACR_ATTRIBUTE}",
         f"POST {base}/admin-api/applications/fga-create-policy  # {app}'s own policy, unless it has one",
-        f"POST {base}/admin-api/xacml/import-alfa  # the demo policy into it, only while {app} enforces none",
+        f"POST {base}/admin-api/xacml/import-alfa  # the demo policy into it (when {app} enforces none yet, or this script's own)",
         f"POST {base}/admin-api/applications/fga-enable  # {app} enforces its own policy (the realm root is untouched)",
         f"POST {base}/admin-api/applications/add  # {PEP_EVENT} in ssfAllowedEvents, only if {app} restricts them",
         f"# write \"pep\": {{\"name\": \"{name}\", \"mode\": \"{mode}\", \"assertionKey\": \"{PEP_KEY}\"}} into the configuration",
@@ -635,6 +724,36 @@ def write_pep_section(config_path: str, name: str, mode: str) -> None:
     path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
 
 
+def own_policy(api, get, app: str) -> dict:
+    """Step 5, and the application's page after it."""
+    # Step 5: the application's own policy. Written while it enforces none, and rewritten with the
+    # current version while it enforces this script's own (a PolicyId in OWN_POLICY_IDS), so a new
+    # rule reaches an existing install; a policy under any other PolicyId is an administrator's and
+    # is left alone. The realm root is never set.
+    page_path = f"/applications?application={urllib.parse.quote(app, safe='')}"
+    page = get(page_path)["body"].get("page") or {}
+    fga = page.get("fga") or {}
+    current_id = (fga.get("policy") or {}).get("policyId") or ""
+    if fga.get("enforced") is True and current_id not in OWN_POLICY_IDS:
+        print(f"{app} already enforces a policy of its own ({current_id or 'unnamed'}); it is left as it is.")
+    elif fga.get("enforced") is True:
+        policy = (fga.get("policy") or {}).get("name") or fga.get("reference")
+        _ok(api("/xacml/import-alfa", {"name": policy, "alfa": orders_policy()}), f"writing {policy}")
+        print(f"{app} enforces this script's policy {policy}; it now holds the current version.")
+    else:
+        _ok(api("/applications/fga-create-policy", {"application": app}), f"{app}'s own policy", allow="already")
+        page = get(page_path)["body"].get("page") or {}
+        fga = page.get("fga") or {}
+        policy = (fga.get("policy") or {}).get("name") or fga.get("reference")
+        if not policy:
+            raise SystemExit(f"{app}'s page names no policy of its own: {json.dumps(fga)[:300]}")
+        _ok(api("/xacml/import-alfa", {"name": policy, "alfa": orders_policy()}), f"writing {policy}")
+        _ok(api("/applications/fga-enable", {"application": app}), f"enforcing {app}'s own policy")
+        print(f"{app} now enforces its own policy {policy}: read on an order needs an AuthnContextClassRef; "
+              f"read on {ATTRIBUTE_PROTECTED} needs {TEST_ATTRIBUTE}={TEST_ATTRIBUTE_VALUE}; anything else is denied.")
+    return page
+
+
 def setup_pep(api, get, files: DemoFiles, config_path: str, name: str, mode: str) -> None:
     """docs/remote-pep.md's steps 2 to 6 for the demo. Safe to run again."""
     app = files.entity_id
@@ -664,23 +783,7 @@ def setup_pep(api, get, files: DemoFiles, config_path: str, name: str, mode: str
     # Step 4: the claim the policy reads.
     _ok(api("/xacml/authzen/set-attribute", {"object": "subject", "property": "acr", "attributeId": ACR_ATTRIBUTE}),
         "the catalogue row subject.acr")
-    # Step 5: the application's own policy, written only while it enforces none, so an
-    # administrator's edits survive a re-run. The realm root is never set.
-    page_path = f"/applications?application={urllib.parse.quote(app, safe='')}"
-    page = get(page_path)["body"].get("page") or {}
-    fga = page.get("fga") or {}
-    if fga.get("enforced") is True:
-        print(f"{app} already enforces its own policy; it is left as it is.")
-    else:
-        _ok(api("/applications/fga-create-policy", {"application": app}), f"{app}'s own policy", allow="already")
-        page = get(page_path)["body"].get("page") or {}
-        fga = page.get("fga") or {}
-        policy = (fga.get("policy") or {}).get("name") or fga.get("reference")
-        if not policy:
-            raise SystemExit(f"{app}'s page names no policy of its own: {json.dumps(fga)[:300]}")
-        _ok(api("/xacml/import-alfa", {"name": policy, "alfa": orders_policy()}), f"writing {policy}")
-        _ok(api("/applications/fga-enable", {"application": app}), f"enforcing {app}'s own policy")
-        print(f"{app} now enforces its own policy {policy}: read on an order needs an AuthnContextClassRef; anything else is denied.")
+    page = own_policy(api, get, app)
     # Step 6: only an application that restricts its streams needs the event named.
     allowed = (page.get("attributes") or {}).get("ssfAllowedEvents") or []
     if isinstance(allowed, str):
