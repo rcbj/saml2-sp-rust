@@ -44,8 +44,33 @@ impl KeyMaterial {
     }
 }
 
+/// What a generated certificate names: its common name, an organization
+/// (empty: none) and URIs for its subjectAltName (a service provider's
+/// entityID), so the certificate says whose it is wherever it is listed.
+#[derive(Clone, Debug, Default)]
+pub struct CertificateSubject {
+    pub common_name: String,
+    pub organization: String,
+    pub uris: Vec<String>,
+}
+
+/// The subject `saml2-sp generate-keys` gives a service provider's key pair
+/// when it is not told otherwise: `CN=<common_name>`, `O=saml2-sp`, and the
+/// entityID as a subjectAltName URI when it is a URI. Never a bare host name.
+pub fn service_provider_subject(common_name: &str, entity_id: &str) -> CertificateSubject {
+    let common_name = if common_name.trim().is_empty() { "saml2-sp service provider" } else { common_name.trim() };
+    let uris = if entity_id.contains(':') && !entity_id.chars().any(char::is_whitespace) { vec![entity_id.to_string()] } else { Vec::new() };
+    CertificateSubject { common_name: common_name.to_string(), organization: "saml2-sp".into(), uris }
+}
+
 /// An RSA key and a self-signed certificate. `bits` is 2048, 3072, or 4096.
 pub fn create_self_signed_key_pair(common_name: &str, days: i64, bits: usize) -> Result<KeyMaterial, SamlError> {
+    create_self_signed_key_pair_for(&CertificateSubject { common_name: common_name.to_string(), ..CertificateSubject::default() }, days, bits)
+}
+
+/// [`create_self_signed_key_pair`] with a whole subject: the common name, an
+/// organization and subjectAltName URIs.
+pub fn create_self_signed_key_pair_for(subject: &CertificateSubject, days: i64, bits: usize) -> Result<KeyMaterial, SamlError> {
     let days = if days <= 0 { 1095 } else { days };
     let bits = if bits == 0 { 3072 } else { bits };
     let private_key = RsaPrivateKey::new(&mut OsRng, bits).map_err(|e| err("config", format!("the key could not be generated: {e}")))?;
@@ -57,7 +82,14 @@ pub fn create_self_signed_key_pair(common_name: &str, days: i64, bits: usize) ->
     params.not_before = not_before;
     params.not_after = not_after;
     params.distinguished_name = rcgen::DistinguishedName::new();
-    params.distinguished_name.push(DnType::CommonName, common_name);
+    params.distinguished_name.push(DnType::CommonName, subject.common_name.as_str());
+    if !subject.organization.is_empty() {
+        params.distinguished_name.push(DnType::OrganizationName, subject.organization.as_str());
+    }
+    for uri in &subject.uris {
+        let name = rcgen::string::Ia5String::try_from(uri.as_str()).map_err(|e| err("config", format!("{uri} cannot be a subjectAltName URI: {e}")))?;
+        params.subject_alt_names.push(rcgen::SanType::URI(name));
+    }
     params.is_ca = IsCa::NoCa;
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature, KeyUsagePurpose::KeyEncipherment];
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth, ExtendedKeyUsagePurpose::ClientAuth];

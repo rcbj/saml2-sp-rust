@@ -5,15 +5,16 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use saml2_sp::{create_self_signed_key_pair, metadata_document, read_idp_metadata, resolve_config};
+use saml2_sp::{create_self_signed_key_pair_for, metadata_document, read_idp_metadata, resolve_config, service_provider_subject};
 use serde_json::{Map, Value};
 
 const USAGE: &str = "Usage:
-  saml2-sp generate-keys --config <saml.json> [--cn <name>] [--days <n>] [--bits <n>] [--force]
-  saml2-sp generate-keys --key <file> --cert <file> [--cn <name>] [--days <n>] [--bits <n>] [--force]
+  saml2-sp generate-keys --config <saml.json> [--cn <name>] [--entity-id <url>] [--days <n>] [--bits <n>] [--force]
+  saml2-sp generate-keys --key <file> --cert <file> [--cn <name>] [--entity-id <url>] [--days <n>] [--bits <n>] [--force]
       A new RSA key and a self-signed certificate, written where the configuration's privateKey and
       certificate point (or to --key and --cert). Refuses to replace existing files without --force.
-      The common name defaults to the host of the configuration's entityId.
+      The subject is CN=<--cn, default 'saml2-sp service provider'>, O=saml2-sp, and the entityID
+      (--entity-id, else the configuration's entityId) as a subjectAltName URI: never a bare host.
 
   saml2-sp metadata --config <saml.json> [--out <file>] [--entity-id <url>] [--acs-url <url>]
       This service provider's SAML metadata, from the configuration and its certificate. Written to
@@ -68,7 +69,7 @@ fn parse_args(argv: &[String]) -> Result<(String, BTreeMap<String, String>), Str
     Ok((command, args))
 }
 
-struct Locations { key: String, cert: String, cn: String }
+struct Locations { key: String, cert: String, cn: String, entity_id: String }
 
 fn generate_keys(args: &BTreeMap<String, String>) -> Result<(), String> {
     let paths = key_paths(args)?;
@@ -88,12 +89,14 @@ fn generate_keys(args: &BTreeMap<String, String>) -> Result<(), String> {
         }
         _ => 3072,
     };
-    let pair = create_self_signed_key_pair(&paths.cn, days, bits).map_err(|e| e.to_string())?;
+    let subject = service_provider_subject(&paths.cn, &paths.entity_id);
+    let pair = create_self_signed_key_pair_for(&subject, days, bits).map_err(|e| e.to_string())?;
     write_mode(&paths.key, &pair.private_key_pem, 0o600)?;
     write_mode(&paths.cert, &pair.certificate_pem, 0o644)?;
     println!("Wrote the private key  {} (mode 600)", paths.key);
     println!("Wrote the certificate  {}", paths.cert);
-    println!("  subject   CN={}", paths.cn);
+    println!("  subject   CN={}, O={}", subject.common_name, subject.organization);
+    if !subject.uris.is_empty() { println!("  altname   URI:{}", subject.uris.join(", URI:")); }
     println!("  valid to  {}", pair.valid_to());
     println!("  sha256    {}", pair.fingerprint256());
     Ok(())
@@ -102,7 +105,8 @@ fn generate_keys(args: &BTreeMap<String, String>) -> Result<(), String> {
 fn key_paths(args: &BTreeMap<String, String>) -> Result<Locations, String> {
     let mut key = args.get("key").cloned().unwrap_or_default();
     let mut cert = args.get("cert").cloned().unwrap_or_default();
-    let mut cn = args.get("cn").cloned().unwrap_or_default();
+    let cn = args.get("cn").cloned().unwrap_or_default();
+    let mut entity_id = args.get("entity-id").cloned().unwrap_or_default();
     if let Some(config_path) = args.get("config") {
         let raw = read_object(config_path)?;
         let base = abs_path(config_path).parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
@@ -116,16 +120,12 @@ fn key_paths(args: &BTreeMap<String, String>) -> Result<Locations, String> {
         };
         if key.is_empty() { key = at(&raw_string(&raw, "privateKey"), "privateKey")?; }
         if cert.is_empty() { cert = at(&raw_string(&raw, "certificate"), "certificate")?; }
-        if cn.is_empty() {
-            let entity = raw_string(&raw, "entityId");
-            if !entity.is_empty() { cn = host_of(&entity).unwrap_or(entity); }
-        }
+        if entity_id.is_empty() { entity_id = raw_string(&raw, "entityId"); }
     }
     if key.is_empty() || cert.is_empty() {
         return Err(format!("generate-keys needs --config, or --key and --cert\n\n{USAGE}"));
     }
-    if cn.is_empty() { cn = "saml2-sp service provider".to_string(); }
-    Ok(Locations { key: abs_string(&key), cert: abs_string(&cert), cn })
+    Ok(Locations { key: abs_string(&key), cert: abs_string(&cert), cn, entity_id })
 }
 
 fn write_metadata(args: &BTreeMap<String, String>) -> Result<(), String> {
@@ -173,14 +173,6 @@ fn read_object(path: &str) -> Result<Map<String, Value>, String> {
 
 fn raw_string(obj: &Map<String, Value>, key: &str) -> String {
     obj.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
-}
-
-fn host_of(entity: &str) -> Option<String> {
-    let rest = entity.split_once("://").map(|(_, rest)| rest).unwrap_or(entity);
-    let hostport = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if hostport.is_empty() { return None; }
-    let host = if let Some(inner) = hostport.strip_prefix('[') { inner.split(']').next().unwrap_or("") } else { hostport.split(':').next().unwrap_or("") };
-    if host.is_empty() { None } else { Some(host.to_string()) }
 }
 
 fn exists(path: &str) -> bool { Path::new(path).exists() }
