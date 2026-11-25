@@ -302,6 +302,10 @@ def rewrite_config(source, dest, sts_origin, demo_origin):
     ssf = raw.get("ssf")
     if not isinstance(ssf, dict):
         ssf = {}
+    # A client certificate another iya-sts issued is not this one's: the install
+    # script issues the receiver its own (the files are not in the copy anyway).
+    ssf.pop("clientCertificate", None)
+    ssf.pop("clientKey", None)
     ssf["transmitter"] = sts_origin.rstrip("/")
     ssf["pollIntervalMs"] = 1000
     raw["ssf"] = ssf
@@ -999,6 +1003,13 @@ def main():
             "session-revoked to end the local session",
         )
         result = {"ok": True, "subject": signed_in.get("subject"), "idpCaInImage": chain_count, "events": finished.get("events")}
+        if pep:
+            # The receiver acknowledges a SET on its NEXT poll (after any Remove
+            # Subject the ended session queued). Replacing the container before
+            # that leaves session-revoked unacknowledged, and the local run's
+            # demo would receive it again and end its new session. Three poll
+            # intervals (pollIntervalMs 1000) let the acknowledgement go out.
+            time.sleep(3)
         if pep:
             # THEN local: the same image and iya-sts, the copy that says local.
             start_demo(image, demo_name, demo_port, demo_origin, mounts, env={"SAML_CONFIG": "/app/demo/" + PEP_LOCAL_CONFIG})
