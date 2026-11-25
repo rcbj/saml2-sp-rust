@@ -592,14 +592,14 @@ def main(argv: list[str] | None = None) -> None:
     print("authn.multipleAccounts is on: one browser may hold several signed-in people.")
     if files.ssf_transmitter:
         certificate_pem = Path(files.cert).read_text(encoding="utf-8")
-        for call in ssf_calls(files, base, certificate_pem):
-            path = call["path"][len(f"{base}/admin-api"):]
-            reply = api(path, call["body"])
+        for step in ssf_calls(files, base, certificate_pem):
+            path = step["path"][len(f"{base}/admin-api"):]
+            reply = api(path, step["body"])
             errors = " ".join(_errors_of(reply["body"]))
             if not reply["body"].get("ok") and not re.search(r"already", errors, re.I):
-                raise SystemExit(f"{call['why']}: refused: {json.dumps(reply['body'])[:400]}")
+                raise SystemExit(f"{step['why']}: refused: {json.dumps(reply['body'])[:400]}")
             if not reply["body"].get("ok"):
-                print(f"  {call['why']}: already so ({errors[:160]})")
+                print(f"  {step['why']}: already so ({errors[:160]})")
         print(f"Shared Signals: {files.entity_id} holds SSF_MANAGE and authenticates to /ssf/* with its own certificate (mutual TLS).")
     url = idp_metadata_url(base, files.entity_id)
     status, data = _request(url, "GET", {"accept": "application/samlmetadata+xml"}, None, ca)
