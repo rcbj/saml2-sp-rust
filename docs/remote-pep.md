@@ -219,6 +219,34 @@ The receiver also tells the transmitter whose events it wants. A transmitter may
 - **Rotating the key.** Generate a new key, certify it with `issue-pep-credential` (add `revokePrevious: true` to retire the old one), replace the file, and call `pep().unwrap().reload_key()` (or wait up to 30 s). The tokens bound to the old key are dropped.
 - **Audit.** In `local` mode each decision becomes an audit row in iya-sts (`authzen.remote.decision`). In `central` mode iya-sts records its own.
 
+## Credentials
+
+The README's [Credentials](../README.md#credentials) section covers every credential the demo uses. This section covers the embedded PEP's in detail.
+
+### The application's own credentials
+
+The SAML key pair (`privateKey`/`certificate`) signs AuthnRequests and decrypts assertions, and iya-sts learns it from the SP metadata. The Shared Signals receiver presents its own TLS client certificate, which the realm issues the application (`ssf.clientCertificate`/`ssf.clientKey`), and falls back to the SAML key pair without one. The PEP uses neither.
+
+### The embedded PEP's credentials
+
+- **The service account** (step 2): a directory account with no password, in `remote-peps`. It is the PEP's identity. The PEP's key is bound to it, and through it to one application (`application`, by default this SP's `entityId`).
+- **The key** (`assertionKey`, step 3): an EC P-256 key the PEP alone holds. Make it yourself and keep it 0600. iya-sts certifies it from its CSR (`issue-pep-credential`) and records it for the account. With an unchanged key, `set-pep-application` binds the account again.
+- **What it authenticates:** every call the PEP makes. It signs an RFC 7523 self-assertion for a DPoP-bound (RFC 9449) access token, and signs each DPoP proof. Tokens are kept per audience and renewed 30 s before they expire. They cover registration and the heartbeat, the policy and catalogue pulls (`local`), AuthZEN evaluation (`central`), the PIP (`POST /xacml/pip`) and decision records. No token, key or proof is logged.
+- **Not the application's key:** `ServiceProvider` refuses a configuration whose `assertionKey` has the JWK thumbprint of `privateKey`. That key signs the service provider's requests, decrypts its assertions and may be the receiver's TLS key. A PEP key that is also one of those would let anyone who holds either credential act as the other, and revoking one would revoke both. Only `privateKey` is compared. `ssf.clientKey` is a different, realm-issued key.
+- **Rotation:** replace the key file and certify the new key (`issue-pep-credential` with its CSR). The PEP reads the file again when it changes and drops every token it held. With the demo, delete `demo/generated/pep-key.pem` and run the install script again.
+
+### Install-time only
+
+The steps above are management calls. Their token comes from a management client's secret (the demo's install script uses `sts-api-client` with `ADMIN_API_CLIENT_SECRET`, from the environment, never stored). The PEP never sees that secret.
+
+### Trust material
+
+`tlsCa` (default `idpCa`, iya-sts's TLS listener chain) verifies iya-sts for the PEP's calls. The PEP verifies no signature itself. A `pep-policies-changed` event reaches it only through the receiver, which verified the SET against the transmitter's JWKS. The PEP then pulls the policies with its own token.
+
+### Development and product iya-sts
+
+The PEP's credential is the same in both modes: a certified key and a DPoP-bound token. The receiver's realm-issued TLS client certificate is also checked the same way in both modes.
+
 ## Troubleshooting
 
 | What you see | Likely cause |
