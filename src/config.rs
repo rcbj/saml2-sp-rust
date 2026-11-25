@@ -70,6 +70,11 @@ impl Config {
         crate::http::TlsOptions { cert, key, ca: self.idp_ca.clone() }
     }
 
+    /// `ssf.clientKey` (PEM), when the receiver has a TLS client identity of its own.
+    pub(crate) fn ssf_client_key(&self) -> Option<&str> {
+        self.ssf_client.as_ref().map(|(_, key)| key.as_str())
+    }
+
     /// Whether the receiver has a TLS client identity of its own
     /// (`ssf.clientCertificate` / `ssf.clientKey`) rather than the SP key pair.
     pub fn ssf_client_is_separate(&self) -> bool {

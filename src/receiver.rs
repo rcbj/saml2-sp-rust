@@ -216,6 +216,14 @@ impl SignalsReceiver {
         #[allow(unused_mut)]
         let mut handlers: HashMap<String, Vec<Handler>> = HashMap::new();
         // The embedded PEP's policy events ride this stream (iya-sts#1206 D4).
+        // D1: the PEP's key is its own, and the TLS client key (ssf.clientKey,
+        // or the SP key pair it falls back to) is the receiver's.
+        #[cfg(feature = "pep")]
+        if let (Some(pep), Some(tls)) = (&opt.pep, &opt.tls) {
+            if crate::pep::pem_thumbprint(&tls.key).is_some_and(|thumbprint| thumbprint == pep.key_thumbprint()) {
+                return Err(err("config", "the receiver's TLS client key (ssf.clientKey, or the SP's privateKey it falls back to) is pep.assertionKey; the PEP needs a key of its own"));
+            }
+        }
         #[cfg(feature = "pep")]
         let event_pep = opt.pep.filter(|pep| crate::pep::wants_events(pep));
         #[cfg(feature = "pep")]

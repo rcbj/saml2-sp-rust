@@ -78,7 +78,7 @@ pub(crate) fn section(config: &Map<String, Value>, base: &Path, idp_ca: &str) ->
 
 /// Builds the PEP from the resolved section. Checks that its key is not the
 /// service provider's. Sends nothing; `start` does.
-pub(crate) fn build(section: &Map<String, Value>, idp_entity_id: &str, entity_id: &str, sp_key: &rsa::RsaPrivateKey) -> Result<Arc<Pep>, SamlError> {
+pub(crate) fn build(section: &Map<String, Value>, idp_entity_id: &str, entity_id: &str, sp_key: &rsa::RsaPrivateKey, ssf_client_key: Option<&str>) -> Result<Arc<Pep>, SamlError> {
     let config = PepConfig::from_json(&Value::Object(section.clone()), idp_entity_id, entity_id).map_err(|e| {
         if !section.contains_key("pdpUrl") && e.message.starts_with("pep.pdpUrl") {
             err("config", format!("{}: the identity provider's entityID is not iya-sts's URL, so name the service in pep.pdpUrl", e.message))
@@ -90,7 +90,16 @@ pub(crate) fn build(section: &Map<String, Value>, idp_entity_id: &str, entity_id
     if iya_pep::jwk_thumbprint(&rsa_jwk(sp_key)).as_deref() == Some(pep.key_thumbprint().as_str()) {
         return Err(err("config", "pep.assertionKey is the service provider's privateKey (its signing, decryption and TLS client key); the PEP needs a key of its own"));
     }
+    if ssf_client_key.and_then(pem_thumbprint).is_some_and(|thumbprint| thumbprint == pep.key_thumbprint()) {
+        return Err(err("config", "pep.assertionKey is ssf.clientKey (the Shared Signals receiver's TLS client key); the PEP needs a key of its own"));
+    }
     Ok(Arc::new(pep))
+}
+
+/// The JWK thumbprint of a PEM private key (RSA or EC P-256), or `None` for
+/// one the PEP could not use anyway.
+pub(crate) fn pem_thumbprint(pem: &str) -> Option<String> {
+    iya_pep::key::SigningKey::from_pem(pem).ok().map(|key| key.thumbprint().to_string())
 }
 
 fn rsa_jwk(key: &rsa::RsaPrivateKey) -> Value {

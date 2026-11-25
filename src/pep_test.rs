@@ -585,3 +585,59 @@ fn a_receiver_adding_subjects_names_the_application_its_pep_hears_about() {
     quiet.poll_once().unwrap();
     assert_eq!(tx.subject_calls().len(), before, "{:?}", tx.subject_calls());
 }
+
+/// An EC P-256 key as the install script makes them (`openssl genpkey`),
+/// or rcgen's (also PKCS#8 P-256) where there is no openssl.
+fn ec_key_from_openssl(tag: &str) -> String {
+    let path = std::env::temp_dir().join(format!("saml2-sp-ec-{tag}-{}.pem", std::process::id()));
+    let made = std::process::Command::new("openssl").args(["genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-out"]).arg(&path).output();
+    let pem = match made {
+        Ok(out) if out.status.success() => std::fs::read_to_string(&path).unwrap(),
+        _ => ec_pem(),
+    };
+    let _ = std::fs::remove_file(&path);
+    pem
+}
+
+/// The PEP's key is its own: not `privateKey` (held above), and not the
+/// receiver's TLS client key either, whether that is a separate
+/// `ssf.clientKey` or the SP key pair it falls back to.
+#[test]
+fn the_pep_key_must_differ_from_the_receivers_tls_client_key() {
+    let pdp = start_pdp();
+    let shared = ec_key_from_openssl("shared");
+    let cert = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap().self_signed(&rcgen::KeyPair::from_pem(&shared).unwrap()).unwrap().pem();
+    let ssf = |key: &str| json!({"transmitter": "https://idp.test", "clientCertificate": cert.clone(), "clientKey": key});
+    let section = |tag: &str, key: &str| json!({"name": "pep-demo", "mode": "central", "assertionKey": key_file(tag, key), "pdpUrl": pdp.url});
+
+    // ServiceProvider: pep.assertionKey == ssf.clientKey is refused, naming both.
+    let err = create(json!({"ssf": ssf(&shared), "pep": section("ssf-same", &shared)})).err().expect("refused");
+    assert_eq!(err.code, "config");
+    assert!(err.message.contains("pep.assertionKey") && err.message.contains("ssf.clientKey"), "{}", err.message);
+    assert_eq!(pdp.count("/xacml/pep/register"), 0, "refused before anything is sent");
+
+    // All three keys different: accepted.
+    let other = ec_key_from_openssl("other");
+    let sp = create(json!({"ssf": ssf(&shared), "pep": section("ssf-other", &other)})).unwrap();
+    assert!(sp.pep().is_some() && sp.config.ssf_client_is_separate());
+
+    // SignalsReceiver: a TLS client key that is the PEP's key is refused, both
+    // a separate one and, through ServiceProvider, the SP key pair it falls back to.
+    let tx = start_transmitter(false);
+    let options = |key: String| ReceiverOptions {
+        transmitter: tx.url.clone(),
+        on_end_sessions: Some(Arc::new(|_: &[String], _: &crate::SignalEvent| Ok(()))),
+        tls: Some(crate::TlsOptions { cert: cert.clone(), key, ca: String::new() }),
+        log: Some(Arc::new(Quiet)),
+        pep: sp.pep().cloned(),
+        ..ReceiverOptions::default()
+    };
+    let err = SignalsReceiver::new(options(other.clone())).err().expect("refused");
+    assert_eq!(err.code, "config");
+    assert!(err.message.contains("TLS client key") && err.message.contains("pep.assertionKey"), "{}", err.message);
+    assert!(SignalsReceiver::new(options(shared.clone())).is_ok(), "ssf.clientKey, not the PEP's");
+    assert!(SignalsReceiver::new(options(sp.config.ssf_tls().key)).is_ok(), "the receiver's own key");
+    let fallback = create(json!({"pep": section("fallback", &other)})).unwrap();
+    assert!(!fallback.config.ssf_client_is_separate());
+    assert_ne!(fallback.config.ssf_tls().key, other, "the fallback is the SP key pair, which the PEP key may not be (held by the privateKey check)");
+}

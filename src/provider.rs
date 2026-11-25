@@ -85,7 +85,7 @@ impl ServiceProvider {
         // PEP's own thread, and decisions are Unavailable until then.
         #[cfg(feature = "pep")]
         if let Some(section) = &sp.config.pep {
-            let pep = crate::pep::build(section, &sp.idp.entity_id, &sp.config.entity_id, &sp.config.private_key)?;
+            let pep = crate::pep::build(section, &sp.idp.entity_id, &sp.config.entity_id, &sp.config.private_key, sp.config.ssf_client_key())?;
             pep.start().map_err(|e| err("config", e.message))?;
             sp.pep = Some(pep);
         }
