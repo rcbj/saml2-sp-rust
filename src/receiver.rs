@@ -13,7 +13,7 @@ use crate::events::{default_ending_events, default_events_requested, event, stri
 use crate::http::{send, TlsOptions};
 use crate::jws::verify_compact_jws;
 use crate::response::SamlLogin;
-use crate::session::{tracked_from, MemorySessionIndex};
+use crate::session::{tracked_from, MemorySessionIndex, SessionRecord};
 
 const POLL_METHOD: &str = "urn:ietf:rfc:8936";
 
@@ -61,6 +61,13 @@ pub struct ReceiverOptions {
     pub poll_interval_ms: u64,
     pub max_events: u64,
     pub log: Option<Arc<dyn Logger>>,
+    /// Tell the transmitter which subjects this receiver cares about (SSF 1.0
+    /// Add Subject / Remove Subject): add a signed-in person's identifiers
+    /// when `track` starts a session, remove them when the last local session
+    /// for them ends. Default `true` (`ssf.addSubjects` in a configuration
+    /// file; [`ssf_add_subjects`] reads it). Without the transmitter's
+    /// `add_subject_endpoint` / `remove_subject_endpoint` nothing is sent.
+    pub add_subjects: bool,
     /// The service provider's embedded PEP (`ServiceProvider::pep`). When it
     /// wants policy events, the stream asks for `pep-policies-changed` and
     /// each verified one is handed to it.
@@ -83,10 +90,34 @@ impl Default for ReceiverOptions {
             poll_interval_ms: 0,
             max_events: 0,
             log: None,
+            add_subjects: true,
             #[cfg(feature = "pep")]
             pep: None,
         }
     }
+}
+
+/// What an `ssf` block's `addSubjects` says: `true` when it is absent, an
+/// error when it is not a boolean.
+pub fn ssf_add_subjects(ssf: Option<&Value>) -> Result<bool, SamlError> {
+    match ssf.and_then(|block| block.get("addSubjects")) {
+        None | Some(Value::Null) => Ok(true),
+        Some(Value::Bool(on)) => Ok(*on),
+        Some(_) => Err(err("config", "ssf.addSubjects must be true or false")),
+    }
+}
+
+/// The most Add/Remove Subject calls held for the next poll; the oldest go first.
+const MAX_SUBJECT_CALLS: usize = 1000;
+
+/// One Add Subject or Remove Subject call waiting for the poll thread: the
+/// identifier format (`iss_sub` or `email`, the ones events are matched on)
+/// and its value.
+#[derive(Clone, Debug)]
+struct SubjectCall {
+    add: bool,
+    format: &'static str,
+    value: String,
 }
 
 struct Flight {
@@ -144,6 +175,11 @@ struct Inner {
     poll_interval: Duration,
     max_events: u64,
     log: Arc<dyn Logger>,
+    add_subjects: bool,
+    /// Add/Remove Subject calls for the poll thread, in order.
+    subject_calls: Mutex<Vec<SubjectCall>>,
+    /// The last Add/Remove Subject refusal or failure, for the receiver's health.
+    subject_error: Mutex<Option<String>>,
     /// The PEP whose policy events this stream carries, told by `start`
     /// whether the stream does.
     #[cfg(feature = "pep")]
@@ -214,6 +250,9 @@ impl SignalsReceiver {
                 poll_interval: Duration::from_millis(interval),
                 max_events,
                 log,
+                add_subjects: opt.add_subjects,
+                subject_calls: Mutex::new(Vec::new()),
+                subject_error: Mutex::new(None),
                 #[cfg(feature = "pep")]
                 pep: event_pep,
                 #[cfg(feature = "pep")]
@@ -233,12 +272,100 @@ impl SignalsReceiver {
         })
     }
 
+    /// Tracks a local session, so an event about its person or IdP session
+    /// can end it. With `add_subjects` (the default) it also queues an Add
+    /// Subject call for each identifier events are matched on (`iss_sub` with
+    /// the subject attribute, `email`), sent from the poll thread before the
+    /// next poll: sign-in never waits for the transmitter.
     pub fn track(&self, local_id: &str, login: &SamlLogin, expires_at_ms: Option<i64>) {
-        self.inner.index.add(tracked_from(local_id, login, &self.inner.subject_attribute, expires_at_ms));
+        let record = tracked_from(local_id, login, &self.inner.subject_attribute, expires_at_ms);
+        self.inner.index.add(record.clone());
+        if self.inner.add_subjects {
+            for (format, value) in identifiers(&record) {
+                self.queue_subject(SubjectCall { add: true, format, value });
+            }
+        }
     }
 
+    /// Stops tracking a local session (a local sign-out or a single logout).
+    /// When it was the last one for its person, Remove Subject is queued for
+    /// each identifier no other session holds.
     pub fn untrack(&self, local_id: &str) {
-        self.inner.index.remove(local_id);
+        self.forget(local_id);
+    }
+
+    /// The last Add/Remove Subject refusal or failure, if any. These are never
+    /// fatal and never retried: the logger heard each one too.
+    pub fn subject_error(&self) -> Option<String> {
+        self.inner.subject_error.lock().expect("subject error").clone()
+    }
+
+    fn forget(&self, local_id: &str) {
+        let Some(record) = self.inner.index.take(local_id) else { return };
+        if !self.inner.add_subjects {
+            return;
+        }
+        for (format, value) in identifiers(&record) {
+            let others = if format == "email" { self.inner.index.by_email(&value) } else { self.inner.index.by_person(&value) };
+            if others.is_empty() {
+                self.queue_subject(SubjectCall { add: false, format, value });
+            }
+        }
+    }
+
+    fn queue_subject(&self, call: SubjectCall) {
+        let mut calls = self.inner.subject_calls.lock().expect("subject calls");
+        if calls.len() >= MAX_SUBJECT_CALLS {
+            calls.remove(0);
+            self.inner.log.warn("ssf: too many Add/Remove Subject calls waiting for the transmitter; dropped the oldest");
+        }
+        calls.push(call);
+    }
+
+    /// Sends the waiting Add/Remove Subject calls (SSF 1.0 §8.1.3.2 and
+    /// §8.1.3.3), once each, on the poll thread. A transmitter that publishes
+    /// no such endpoint gets none. A refusal is reported, never retried: a
+    /// 403 is expected when the transmitter knows no active session for the
+    /// subject yet (iya-sts#2234), and the next sign-in adds it again.
+    fn send_subject_calls(&self) {
+        let (add_endpoint, remove_endpoint, issuer, stream_id) = {
+            let state = self.inner.state.lock().expect("state");
+            let text = |name: &str| string_of(state.config.get(name).unwrap_or(&Value::Null));
+            (text("add_subject_endpoint"), text("remove_subject_endpoint"), text("issuer"), string_of(state.stream.get("stream_id").unwrap_or(&Value::Null)))
+        };
+        if stream_id.is_empty() {
+            return; // not started yet: they wait for the first poll
+        }
+        let calls = std::mem::take(&mut *self.inner.subject_calls.lock().expect("subject calls"));
+        for call in calls {
+            let (endpoint, what) = if call.add { (&add_endpoint, "adding") } else { (&remove_endpoint, "removing") };
+            if endpoint.is_empty() {
+                continue;
+            }
+            let subject = if call.format == "email" {
+                json!({"format": "email", "email": call.value})
+            } else {
+                json!({"format": "iss_sub", "iss": issuer, "sub": call.value})
+            };
+            let mut body = json!({"stream_id": stream_id, "subject": subject});
+            if call.add {
+                body["verified"] = Value::Bool(true);
+            }
+            let problem = match self.call("POST", endpoint, Some(&body)) {
+                Ok((200 | 204, _)) => None,
+                Ok((403, _)) => Some((false, format!("ssf: {what} an {} subject on stream {stream_id} was refused (403; the transmitter may know no active session for it yet); not retried", call.format))),
+                Ok((status, parsed)) => {
+                    let mut text = parsed.to_string();
+                    if text.len() > 300 { text.truncate(300); }
+                    Some((true, format!("ssf: {what} an {} subject on stream {stream_id} answered {status}: {text}", call.format)))
+                }
+                Err(error) => Some((true, format!("ssf: {what} an {} subject on stream {stream_id} failed: {error}", call.format))),
+            };
+            if let Some((unexpected, line)) = problem {
+                if unexpected { self.inner.log.error(&line) } else { self.inner.log.warn(&line) }
+                *self.inner.subject_error.lock().expect("subject error") = Some(line);
+            }
+        }
     }
 
     /// The index of tracked local sessions (`ServiceProvider::decide_session`).
@@ -405,6 +532,7 @@ impl SignalsReceiver {
     }
 
     fn poll_now(&self) -> Result<bool, SamlError> {
+        self.send_subject_calls();
         let (url, ack, set_errs) = {
             let mut state = self.inner.state.lock().expect("state");
             let url = state.stream.get("delivery").and_then(|d| d.get("endpoint_url")).and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -529,7 +657,7 @@ impl SignalsReceiver {
                 }
                 if ends {
                     for local_id in &sessions {
-                        self.inner.index.remove(local_id);
+                        self.forget(local_id);
                     }
                 }
             }
@@ -739,6 +867,19 @@ impl SignalsReceiver {
         self.inner.log.error(&line);
         stream
     }
+}
+
+/// The identifiers a session's events are matched on, as Add/Remove Subject
+/// formats: the subject attribute as `iss_sub`'s `sub`, and the email address.
+fn identifiers(record: &SessionRecord) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    if !record.person.is_empty() {
+        out.push(("iss_sub", record.person.clone()));
+    }
+    if !record.email.is_empty() {
+        out.push(("email", record.email.clone()));
+    }
+    out
 }
 
 fn audience_list(value: Option<&Value>) -> Vec<String> {

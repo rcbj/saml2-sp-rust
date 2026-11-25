@@ -45,6 +45,14 @@ struct TxState {
     hold: Option<Arc<(Mutex<bool>, std::sync::Condvar)>>,
     entered: Arc<(Mutex<bool>, std::sync::Condvar)>,
     held_once: bool,
+    /// Every Add/Remove Subject call: ("add" or "remove", its body).
+    subject_calls: Vec<(String, Value)>,
+    /// The status Add Subject answers (0: 204).
+    add_status: u16,
+    /// Whether the metadata publishes add_subject_endpoint and remove_subject_endpoint.
+    subject_endpoints: bool,
+    /// Publishes this add_subject_endpoint instead of its own.
+    add_endpoint: Option<String>,
 }
 
 pub(crate) struct Transmitter {
@@ -74,6 +82,16 @@ impl Transmitter {
     /// Every poll answers `status` from now on (0: answer normally again).
     pub(crate) fn poll_status(&self, status: u16) {
         self.state.lock().unwrap().poll_status = status;
+    }
+
+    /// The Add/Remove Subject calls so far, as ("add"|"remove", format, value).
+    fn subject_calls(&self) -> Vec<(String, String, String)> {
+        self.state.lock().unwrap().subject_calls.iter().map(|(kind, body)| {
+            let subject = &body["subject"];
+            let format = subject["format"].as_str().unwrap_or("").to_string();
+            let value = if format == "email" { subject["email"].clone() } else { subject["sub"].clone() };
+            (kind.clone(), format, value.as_str().unwrap_or("").to_string())
+        }).collect()
     }
 
     pub(crate) fn put_set(&self, event_type: &str, sub_id: Value, extra: Map<String, Value>, key: Option<&rsa::RsaPrivateKey>, aud: &str, iss: &str) -> String {
@@ -107,6 +125,7 @@ pub(crate) fn start_transmitter(hold: bool) -> Transmitter {
         hold: if hold { Some(Arc::new((Mutex::new(true), std::sync::Condvar::new()))) } else { None },
         entered: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
         held_once: false,
+        subject_calls: Vec::new(), add_status: 0, subject_endpoints: true, add_endpoint: None,
     }));
     let shared = state.clone();
     let url_slot: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
@@ -117,12 +136,25 @@ pub(crate) fn start_transmitter(hold: bool) -> Transmitter {
         let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
         let write = |status: u16, value: Value| (status, "application/json", serde_json::to_vec(&value).unwrap_or_default());
         if req.path == "/.well-known/ssf-configuration" {
-            return write(200, json!({
+            let mut config = json!({
                 "issuer": url, "jwks_uri": format!("{url}/jwks"),
                 "configuration_endpoint": format!("{url}/ssf/stream"),
                 "verification_endpoint": format!("{url}/ssf/verify"),
                 "delivery_methods_supported": ["urn:ietf:rfc:8936"]
-            }));
+            });
+            let (published, add_endpoint) = { let g = shared.lock().unwrap(); (g.subject_endpoints, g.add_endpoint.clone()) };
+            if published {
+                config["add_subject_endpoint"] = json!(add_endpoint.unwrap_or_else(|| format!("{url}/ssf/subjects:add")));
+                config["remove_subject_endpoint"] = json!(format!("{url}/ssf/subjects:remove"));
+            }
+            return write(200, config);
+        }
+        if req.method == "POST" && (req.path == "/ssf/subjects:add" || req.path == "/ssf/subjects:remove") {
+            let add = req.path.ends_with(":add");
+            let mut guard = shared.lock().unwrap();
+            guard.subject_calls.push((if add { "add" } else { "remove" }.to_string(), body.clone()));
+            let status = if add && guard.add_status != 0 { guard.add_status } else { 204 };
+            return (status, "application/json", if status == 204 { Vec::new() } else { br#"{"err":"refused"}"#.to_vec() });
         }
         if req.path == "/jwks" { return write(200, json!({"keys": [jwk.clone()]})); }
         if req.path == "/ssf/stream" && req.method == "GET" {
@@ -425,4 +457,131 @@ fn stop_waits_for_an_in_flight_poll() {
     release(&stub);
     stopped.join().unwrap();
     started.join().unwrap().unwrap();
+}
+
+struct Warnings { lines: Mutex<Vec<String>> }
+impl Logger for Warnings {
+    fn info(&self, _: &str) {}
+    fn warn(&self, message: &str) { self.lines.lock().unwrap().push(format!("warn {message}")); }
+    fn error(&self, message: &str) { self.lines.lock().unwrap().push(format!("error {message}")); }
+}
+
+fn subject_receiver(stub: &Transmitter, add_subjects: bool, log: Arc<Warnings>) -> SignalsReceiver {
+    let rx = SignalsReceiver::new(ReceiverOptions {
+        transmitter: stub.url.clone(),
+        on_end_sessions: Some(Arc::new(|_, _| Ok(()))),
+        poll_interval_ms: 60_000,
+        log: Some(log),
+        add_subjects,
+        ..ReceiverOptions::default()
+    }).unwrap();
+    rx.start().unwrap();
+    rx.stop();
+    rx
+}
+
+fn add(format: &str, value: &str) -> (String, String, String) { ("add".into(), format.into(), value.into()) }
+fn remove(format: &str, value: &str) -> (String, String, String) { ("remove".into(), format.into(), value.into()) }
+
+#[test]
+fn sign_in_adds_the_subject_and_the_last_sign_out_removes_it() {
+    let stub = start_transmitter(false);
+    let log = Arc::new(Warnings { lines: Mutex::new(Vec::new()) });
+    let rx = subject_receiver(&stub, true, log.clone());
+    // Before any poll nothing is sent: sign-in never waits for the transmitter.
+    rx.track("L-a1", &login_of("alice", "IDP-A1"), None);
+    assert!(stub.subject_calls().is_empty());
+    rx.poll_once().unwrap();
+    assert_eq!(stub.subject_calls(), vec![add("iss_sub", "urn:uuid:alice"), add("email", "alice@example.com")]);
+    let body = stub.state.lock().unwrap().subject_calls[0].1.clone();
+    assert_eq!((body["stream_id"].clone(), body["subject"]["iss"].clone(), body["verified"].clone()), (json!("s1"), json!(stub.url), json!(true)), "{body}");
+    // A second session for alice adds again; ending one of the two removes nothing.
+    rx.track("L-a2", &login_of("alice", "IDP-A2"), None);
+    rx.untrack("L-a1");
+    rx.poll_once().unwrap();
+    assert_eq!(stub.subject_calls().len(), 4, "{:?}", stub.subject_calls());
+    assert!(stub.subject_calls().iter().all(|(kind, _, _)| kind == "add"), "alice still has L-a2: {:?}", stub.subject_calls());
+    // The last one goes: both identifiers are removed.
+    rx.untrack("L-a2");
+    rx.untrack("L-a2"); // again: not tracked, nothing more
+    rx.poll_once().unwrap();
+    assert_eq!(stub.subject_calls()[4..].to_vec(), vec![remove("iss_sub", "urn:uuid:alice"), remove("email", "alice@example.com")]);
+    assert!(stub.state.lock().unwrap().subject_calls[4].1.get("verified").is_none());
+    assert!(log.lines.lock().unwrap().is_empty(), "{:?}", log.lines.lock().unwrap());
+    assert_eq!(rx.subject_error(), None);
+}
+
+#[test]
+fn a_session_ended_by_an_event_removes_the_subject_when_it_was_the_last() {
+    let stub = start_transmitter(false);
+    let rx = subject_receiver(&stub, true, Arc::new(Warnings { lines: Mutex::new(Vec::new()) }));
+    rx.track("L-b1", &login_of("bob", "IDP-B1"), None);
+    rx.track("L-b2", &login_of("bob", "IDP-B2"), None);
+    rx.poll_once().unwrap();
+    let revoke = |session: &str| json!({"format": "complex", "user": {"format": "iss_sub", "iss": stub.url, "sub": "urn:uuid:bob"}, "session": {"format": "opaque", "id": session}});
+    stub.put_set(event("session_revoked"), revoke("IDP-B1"), Map::new(), None, "", "");
+    rx.poll_once().unwrap();
+    rx.poll_once().unwrap();
+    assert!(!stub.subject_calls().iter().any(|(kind, _, _)| kind == "remove"), "bob still has L-b2: {:?}", stub.subject_calls());
+    stub.put_set(event("account_disabled"), json!({"format": "iss_sub", "iss": stub.url, "sub": "urn:uuid:bob"}), Map::new(), None, "", "");
+    rx.poll_once().unwrap();
+    rx.poll_once().unwrap();
+    let removes: Vec<_> = stub.subject_calls().into_iter().filter(|(kind, _, _)| kind == "remove").collect();
+    assert_eq!(removes, vec![remove("iss_sub", "urn:uuid:bob"), remove("email", "bob@example.com")]);
+}
+
+#[test]
+fn a_refused_add_is_reported_once_and_never_fatal() {
+    let stub = start_transmitter(false);
+    stub.state.lock().unwrap().add_status = 403;
+    let log = Arc::new(Warnings { lines: Mutex::new(Vec::new()) });
+    let rx = subject_receiver(&stub, true, log.clone());
+    rx.track("L-c1", &login_of("carol", "IDP-C1"), None);
+    stub.put_set(event("credential_change"), json!({"format": "iss_sub", "iss": stub.url, "sub": "urn:uuid:carol"}), Map::new(), None, "", "");
+    assert!(!rx.poll_once().unwrap(), "the poll itself still succeeds");
+    assert_eq!(stub.subject_calls().len(), 2);
+    let lines = log.lines.lock().unwrap().clone();
+    assert!(lines.iter().filter(|l| l.starts_with("warn ") && l.contains("(403")).count() == 2, "a 403 is a warning: {lines:?}");
+    assert!(rx.subject_error().is_some_and(|e| e.contains("403")));
+    assert_eq!(rx.session_index().by_person("urn:uuid:carol").len(), 1, "the session stands");
+    // Not retried: the next polls send nothing more.
+    rx.poll_once().unwrap();
+    rx.poll_once().unwrap();
+    assert_eq!(stub.subject_calls().len(), 2);
+    assert!(stub.state.lock().unwrap().acked.len() == 1, "the event was still delivered and acknowledged");
+    // Any other status, or no answer at all, is an error line, still not fatal.
+    stub.state.lock().unwrap().add_status = 500;
+    rx.track("L-c2", &login_of("carl", "IDP-C2"), None);
+    rx.poll_once().unwrap();
+    assert!(log.lines.lock().unwrap().iter().any(|l| l.starts_with("error ") && l.contains("answered 500")), "{:?}", log.lines.lock().unwrap());
+    // An add endpoint nothing answers at: an error line, and the poll still runs.
+    stub.state.lock().unwrap().add_endpoint = Some("http://127.0.0.1:1/subjects:add".into());
+    let down = Arc::new(Warnings { lines: Mutex::new(Vec::new()) });
+    let rx = subject_receiver(&stub, true, down.clone());
+    rx.track("L-c3", &login_of("cara", "IDP-C3"), None);
+    rx.poll_once().unwrap();
+    assert!(down.lines.lock().unwrap().iter().any(|l| l.starts_with("error ") && l.contains("failed")), "{:?}", down.lines.lock().unwrap());
+}
+
+#[test]
+fn nothing_is_sent_without_the_endpoints_or_with_the_switch_off() {
+    let stub = start_transmitter(false);
+    stub.state.lock().unwrap().subject_endpoints = false;
+    let log = Arc::new(Warnings { lines: Mutex::new(Vec::new()) });
+    let rx = subject_receiver(&stub, true, log.clone());
+    rx.track("L-d1", &login_of("dave", "IDP-D1"), None);
+    rx.poll_once().unwrap();
+    rx.untrack("L-d1");
+    rx.poll_once().unwrap();
+    assert!(stub.subject_calls().is_empty());
+    assert!(log.lines.lock().unwrap().is_empty(), "no endpoint is not a problem: {:?}", log.lines.lock().unwrap());
+
+    let stub = start_transmitter(false);
+    let rx = subject_receiver(&stub, false, Arc::new(Warnings { lines: Mutex::new(Vec::new()) }));
+    rx.track("L-e1", &login_of("erin", "IDP-E1"), None);
+    rx.poll_once().unwrap();
+    rx.untrack("L-e1");
+    rx.poll_once().unwrap();
+    assert!(stub.subject_calls().is_empty(), "addSubjects false: {:?}", stub.subject_calls());
+    assert!(ReceiverOptions::default().add_subjects, "on by default");
 }
