@@ -44,6 +44,17 @@ the same two, then the application's OWN policy (never the realm root) moves
 to one that denies read, and within PEP_FLIP_TIMEOUT seconds (30) the GET
 must be 403 with pep-policies-changed received. The fallback poll stays at its
 300 s default, so a change within the bound came through the event.
+
+With --pep, the demo's other protected page is checked for two people. After
+the install script defines attr1 and gives the test user attr1=abc123, this
+script creates a SECOND user (saml-demo-denied) and gives them
+attr1=not-abc123 (/admin-api/users/set-attribute). In each mode, before the
+events: GET /attribute-protected is 200 for the test user and 403 for the
+second (who signs in with a browser of their own, reads /orders/42 (200), and
+signs out again, so the demo holds one session when the events arrive). The
+same run checks that src/authzen/demo-orders.xml, the policy document the
+unit tests serve, is what iya-sts stored for the install script's ALFA
+(--write-xml rewrites it from iya-sts instead).
 """
 
 import base64
@@ -601,19 +612,92 @@ def wait_for(driver, predicate, what):
 
 # The embedded PEP (--pep). Its names, key path and policy are the install
 # script's: --pep central sets the PEP up here.
-from configure_iya_sts import PEP_KEY, orders_policy  # noqa: E402
+from configure_iya_sts import ATTRIBUTE_PROTECTED, PEP_KEY, TEST_ATTRIBUTE, TEST_ATTRIBUTE_VALUE, orders_policy  # noqa: E402
 
 PEP_LOCAL_CONFIG = "saml.pep-local.json"
+# The second test user: signs in like the first, but attr1 is not abc123.
+DENIED_USER = "saml-demo-denied"
+DENIED_VALUE = "not-abc123"
+# What iya-sts stores for orders_policy(): the document the unit tests serve.
+ORDERS_XML = ROOT / "src" / "authzen" / "demo-orders.xml"
 
 
-def flip_policy(client, sts_origin, token, application):
-    """The demo application's own policy (the install script's) now denies read too."""
+def own_policy_name(client, sts_origin, token, application):
+    """The name of the demo application's own policy, from its page."""
     status, page = admin_json(client, sts_origin, token, "GET",
                               "/admin-api/applications?application=" + urllib.parse.quote(application, safe=""))
     fga = ((page.get("page") or {}).get("fga") or {}) if status == 200 else {}
     name = (fga.get("policy") or {}).get("name") or fga.get("reference")
     if not name:
         raise RuntimeError(f"the application's page names no policy of its own: {json.dumps(fga)[:400]}")
+    return name
+
+
+def stored_policy(client, sts_origin, token, name):
+    """The XACML iya-sts stored for a policy (its editor view's document)."""
+    status, parsed = admin_json(client, sts_origin, token, "GET", "/admin-api/xacml/editor?policy=" + urllib.parse.quote(name))
+    if status != 200:
+        raise RuntimeError(f"the editor view of the application's policy answered {status}")
+    found = []
+
+    def walk(value):
+        if isinstance(value, dict):
+            for key, inner in value.items():
+                if key in ("document", "xml") and isinstance(inner, str) and "<" in inner:
+                    found.append(inner)
+                walk(inner)
+        elif isinstance(value, list):
+            for inner in value:
+                walk(inner)
+
+    walk(parsed)
+    if not found:
+        raise RuntimeError(f"the editor view of the application's policy carries no document; its members: {sorted(parsed)[:40]}")
+    return found[0]
+
+
+def check_policy_document(client, sts_origin, token, application, write):
+    """src/authzen/demo-orders.xml must be what iya-sts stored for orders_policy()."""
+    stored = stored_policy(client, sts_origin, token, own_policy_name(client, sts_origin, token, application))
+    if write:
+        ORDERS_XML.write_text(stored.rstrip("\n") + "\n", encoding="utf-8")
+        print("wrote src/authzen/demo-orders.xml from what iya-sts stored", flush=True)
+        return "written"
+    held = ORDERS_XML.read_text(encoding="utf-8") if ORDERS_XML.exists() else ""
+    if held.strip() != stored.strip():
+        raise RuntimeError("src/authzen/demo-orders.xml is not what iya-sts stored for orders_policy() (run with --write-xml)")
+    return "matches"
+
+
+def make_denied_user(client, sts_origin, token, password):
+    """The second test user, after the install script defined attr1: attr1=not-abc123."""
+    status, found = admin_json(client, sts_origin, token, "GET", "/admin-api/users?user=" + urllib.parse.quote(DENIED_USER))
+    if found.get("known") is True:
+        status, parsed = admin_json(client, sts_origin, token, "POST", "/admin-api/users/set-password",
+                                    {"user": DENIED_USER, "password": password, "passwordConfirm": password})
+    else:
+        attributes = {"cn": "SAML Demo Denied", "givenName": "SAML", "sn": "Denied", "displayName": "SAML Demo Denied",
+                      "mail": f"{DENIED_USER}@saml-demo.test"}
+        status, parsed = admin_json(client, sts_origin, token, "POST", "/admin-api/users/create", {
+            "username": DENIED_USER, "invent": False, "credential": "password",
+            "password": password, "passwordConfirm": password, "attributes": attributes,
+        })
+    if status != 200 or not parsed.get("ok"):
+        raise RuntimeError(f"creating {DENIED_USER} answered {status}: {json.dumps(_no_secrets(parsed))[:300]}")
+    status, parsed = admin_json(client, sts_origin, token, "POST", "/admin-api/users/set-attribute",
+                                {"user": DENIED_USER, "attribute": TEST_ATTRIBUTE, "value": DENIED_VALUE})
+    if status != 200 or parsed.get("ok") is False:
+        raise RuntimeError(f"giving {DENIED_USER} {TEST_ATTRIBUTE}={DENIED_VALUE} answered {status}: {json.dumps(parsed)[:300]}")
+    print(f"created {DENIED_USER} with {TEST_ATTRIBUTE}={DENIED_VALUE}", flush=True)
+
+
+def _no_secrets(parsed):
+    return {key: value for key, value in parsed.items() if "password" not in key.lower() and "secret" not in key.lower()}
+
+
+def flip_policy(client, sts_origin, token, application):
+    """The demo application's own policy (the install script's) now denies read too."""
+    name = own_policy_name(client, sts_origin, token, application)
     status, parsed = admin_json(client, sts_origin, token, "POST", "/admin-api/xacml/import-alfa",
                                 {"name": name, "alfa": orders_policy("samlspdemolocked", "deny")})
     if status != 200 or parsed.get("ok") is False:
@@ -638,8 +722,33 @@ def order(driver, method):
     return status, payload
 
 
-def pep_checks(driver, mode):
-    """GET is read (Permit, 200) and POST is write (Deny, 403)."""
+def attribute_protected(driver):
+    status, _headers, payload = driver.client.request("GET", driver.demo_origin + "/" + ATTRIBUTE_PROTECTED, headers={"accept": "text/html"})
+    print(f"GET {status} demo /{ATTRIBUTE_PROTECTED}", flush=True)
+    return status, payload
+
+
+def denied_checks(sts_origin, demo_origin, ca_file, password, mode):
+    """The second user, in a browser of their own: /attribute-protected 403, /orders/42 200, then sign out."""
+    driver = Driver(Client(ca_file), sts_origin, demo_origin, DENIED_USER, password)
+    driver.sign_in()
+    who = driver.status()
+    attribute_status, attribute_body = attribute_protected(driver)
+    read_status, read_body = order(driver, "GET")
+    if attribute_status != 403 or b"Not allowed" not in attribute_body or read_status != 200:
+        why = (attribute_body if attribute_status != 403 else read_body)[:400].decode("utf-8", "replace")
+        raise RuntimeError(f"{mode}: for {DENIED_USER}, GET /{ATTRIBUTE_PROTECTED} answered {attribute_status} and GET /orders/42 {read_status}: {why}")
+    status, _headers, _payload = driver.client.request("POST", demo_origin + "/logout", body=b"", headers={"accept": "text/html"})
+    print(f"POST {status} demo /logout", flush=True)
+    if status != 303:
+        raise RuntimeError(f"{mode}: signing {DENIED_USER} out answered {status}")
+    return {"user": DENIED_USER, "attr1": DENIED_VALUE, "attributeProtected": attribute_status, "readOrder": read_status, "signedOut": True}
+
+
+def pep_checks(driver, mode, denied=None):
+    """GET is read (Permit, 200) and POST is write (Deny, 403). GET /attribute-protected
+    is 200 for the test user (attr1=abc123) and, with `denied` (a function signing the
+    second user in), 403 for that user."""
     deadline = time.time() + 60
     state = {}
     while time.time() < deadline:
@@ -656,7 +765,16 @@ def pep_checks(driver, mode):
     if read_status != 200 or write_status != 403:
         why = (read_body if read_status != 200 else write_body)[:400].decode("utf-8", "replace")
         raise RuntimeError(f"{mode}: GET /orders/42 answered {read_status}, POST {write_status}: {why}")
-    checks = {"mode": state.get("mode"), "registered": True, "readIs200": True, "writeIs403": True}
+    attribute_status, attribute_body = attribute_protected(driver)
+    if attribute_status != 200 or b"<h1>Allowed</h1>" not in attribute_body:
+        why = attribute_body[:400].decode("utf-8", "replace")
+        raise RuntimeError(f"{mode}: GET /{ATTRIBUTE_PROTECTED} answered {attribute_status} for the test user ({TEST_ATTRIBUTE}={TEST_ATTRIBUTE_VALUE}): {why}")
+    checks = {"mode": state.get("mode"), "registered": True, "readIs200": True, "writeIs403": True,
+              "attributeProtected": {"allowed": {"user": driver.username, "attr1": TEST_ATTRIBUTE_VALUE, "status": attribute_status}}}
+    if denied:
+        result = denied()
+        checks["attributeProtected"]["denied"] = {"user": result["user"], "attr1": result["attr1"], "status": result["attributeProtected"]}
+        checks["deniedUser"] = result
     if mode == "local":
         checks["policyCount"] = state.get("policyCount")
     return checks
@@ -718,7 +836,7 @@ def start_demo(image, demo_name, demo_port, demo_origin, mounts, env=None):
     raise RuntimeError("the demo /healthz did not answer ok")
 
 
-def prepare_sts(sts_port, secret):
+def prepare_sts(sts_port, secret, name=None):
     given = os.environ.get("IYA_STS_URL", "").rstrip("/")
     if given:
         print(f"using {given}", flush=True)
@@ -736,7 +854,7 @@ def prepare_sts(sts_port, secret):
             source = cloned
         image = "iya-sts-live:main"
         docker("build", "-t", image, source)
-    name = "iya-sts-live-" + PROFILE["repo"]
+    name = name or "iya-sts-live-" + PROFILE["repo"]
     docker_rm(name)
     docker(
         "run", "-d", "--name", name,
@@ -778,7 +896,7 @@ def configure_demo(work, sts_origin, demo_origin, demo_port, username, password,
         "--idp", sts_origin,
         "--public-url", demo_origin,
         "--test-user", username,
-        *(["--pep", "central"] if pep else []),
+        *(["--pep", "central" if pep is True else pep] if pep else []),
         env=env,
         capture_output=True,
     )
@@ -790,6 +908,7 @@ def configure_demo(work, sts_origin, demo_origin, demo_port, username, password,
 
 def main():
     pep = "--pep" in sys.argv[1:] or os.environ.get("LIVE_PEP", "") in ("1", "true", "yes")
+    write_xml = "--write-xml" in sys.argv[1:]
     sts_port = int(os.environ.get("LIVE_STS_PORT") or 18518)
     demo_port = int(os.environ.get("LIVE_DEMO_PORT") or 18618)
     sts_given = bool(os.environ.get("IYA_STS_URL", "").strip())
@@ -798,6 +917,7 @@ def main():
         raise SystemExit("LIVE_STS_PORT and LIVE_DEMO_PORT must differ and must not bind 3000, 8081, or 18481 to 18495")
     secret = os.environ.get("ADMIN_API_CLIENT_SECRET") or os.environ.get("STS_ADMIN_API_CLIENT_SECRET") or secrets.token_urlsafe(24)
     password = os.environ.get(PROFILE["user_env"]) or secrets.token_urlsafe(18)
+    denied_password = secrets.token_urlsafe(18)
     username = PROFILE["test_user"]
     sts_origin, sts_name = prepare_sts(sts_port, secret)
     demo_origin = f"http://127.0.0.1:{demo_port}"
@@ -843,6 +963,11 @@ def main():
             mounts.append((pep_key, "/app/demo/" + PEP_KEY))
         start_demo(image, demo_name, demo_port, demo_origin, mounts)
         client = Client(ca_file)
+        if pep:
+            # The second user, once the install script has defined attr1.
+            setup_token = mint_admin(client, sts_origin, secret)
+            make_denied_user(client, sts_origin, setup_token, denied_password)
+            pep_result["policyDocument"] = check_policy_document(client, sts_origin, setup_token, pep_result["application"], write_xml)
         driver = Driver(client, sts_origin, demo_origin, username, password)
         driver.sign_in()
         signed_in = wait_for(
@@ -852,7 +977,7 @@ def main():
         )
         print(f"signed in as {signed_in.get('subject')}; {signed_in.get('receiver')}", flush=True)
         if pep:
-            pep_result["central"] = pep_checks(driver, "central")
+            pep_result["central"] = pep_checks(driver, "central", lambda: denied_checks(sts_origin, demo_origin, ca_file, denied_password, "central"))
         token = mint_admin(client, sts_origin, secret)
         session_id = session_id_for(client, sts_origin, token, username)
         emit(client, sts_origin, token, session_id, "credential-change")
@@ -879,7 +1004,7 @@ def main():
             local_driver.sign_in()
             wait_for(local_driver, lambda row: row.get("signedIn") is True and "polling" in str(row.get("receiver") or ""),
                      "a signed-in local-mode demo polling its stream")
-            local = pep_checks(local_driver, "local")
+            local = pep_checks(local_driver, "local", lambda: denied_checks(sts_origin, demo_origin, ca_file, denied_password, "local"))
             token = mint_admin(client, sts_origin, secret)
             local["policyChange"] = flip_check(local_driver, client, sts_origin, token, pep_result["application"])
             pep_result["local"] = local
