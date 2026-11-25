@@ -78,7 +78,7 @@ docker run --rm --network host --user "$(id -u):$(id -g)" -e HOME=/tmp \
 docker compose up --build
 ```
 
-`--pep central` or `--pep local` picks the mode, and running it again switches it, keeping the PEP's account, its key (`demo/generated/pep-key.pem`, 0600, never in the image) and the demo application's own policy. It never changes the realm's root policy. Sign in, then `GET /orders/42` is allowed and any other method is denied. [docs/remote-pep.md](docs/remote-pep.md#the-demo) lists what it does.
+`--pep central` or `--pep local` picks the mode, and running it again switches it, keeping the PEP's account, its key (`demo/generated/pep-key.pem`, 0600, never in the image) and the demo application's own policy. It never changes the realm's root policy. Sign in, then `GET /orders/42` is allowed and any other method is denied. The signed-in page has two tabs: **Session** (`/`) and **Policy enforcement** (`/?tab=pep`), the embedded PEP's `status()` as four collapsible panes (Decisions, Cached policy, The PEP, Control plane), redrawn every 2 s by `demo/public/pep.js` from `GET /pep-status.html`, which keeps a pane you closed closed; `GET /pep-status` is the same as JSON. Both need a sign-in and carry nothing secret. [docs/remote-pep.md](docs/remote-pep.md#the-demo) lists what it does.
 
 ## Tests
 

@@ -251,6 +251,8 @@ docker compose up --build
 
 Run it again against the same iya-sts to switch the mode: the account, the key and the policy (with any edits an administrator made) are kept, and the PEP is bound again. Against a new iya-sts the kept key is certified there. `GET /live-status` shows the PEP's `status()` under `pep`.
 
+The signed-in page has two tabs: **Session** (`/`) and **Policy enforcement** (`/?tab=pep`), the embedded PEP's `status()` as four collapsible panes (Decisions, Cached policy, The PEP, Control plane), redrawn every 2 s by `demo/public/pep.js` from `GET /pep-status.html`, which keeps a pane you closed closed; `GET /pep-status` is the same as JSON. Both need a sign-in and carry nothing secret. Without a `pep` section the tab says there is no embedded PEP.
+
 ## See also
 
 - [`iya-pep`'s README](https://github.com/rcbj/iya-pep-rust#readme): the crate's own API and every configuration member.
