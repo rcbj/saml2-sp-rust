@@ -35,6 +35,15 @@ time = "0.3"
 ua-cryptography-xml-c14n = "0.1"
 ureq = { version = "2", default-features = false, features = ["native-tls"] }
 x509-parser = "0.18"
+# The embedded iya-sts PEP (the `pep` feature; iya-sts#1206).
+iya-pep = { git = "https://github.com/rcbj/iya-pep-rust", branch = "feature/1", optional = true }
+
+[features]
+# The embedded iya-sts PEP in `central` mode: every decision is an AuthZEN
+# evaluation at the service.
+pep = ["dep:iya-pep"]
+# `local` mode too: the PEP's XACML engine decides in process.
+local = ["pep", "iya-pep/local"]
 
 [dev-dependencies]
 regex = "1"

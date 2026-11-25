@@ -27,8 +27,16 @@ pub struct Config {
     pub idp_ca: String,
     pub idp_entity_id: String,
     pub name_id_format: String,
+    /// The `pep` section with this library's defaults filled in (the `pep`
+    /// feature), for `ServiceProvider` to build the embedded PEP from.
+    #[cfg(feature = "pep")]
+    pub(crate) pep: Option<Map<String, Value>>,
     pub(crate) private_key: RsaPrivateKey,
     pub(crate) certificate_der: Vec<u8>,
+    /// `ssf.clientCertificate` and `ssf.clientKey`: the Shared Signals
+    /// receiver's own TLS client identity (PEM certificate, with its chain,
+    /// and PEM private key), when the configuration gives one.
+    pub(crate) ssf_client: Option<(String, String)>,
 }
 
 impl std::fmt::Debug for Config {
@@ -48,12 +56,37 @@ impl std::fmt::Debug for Config {
 }
 
 impl Config {
+    /// The TLS options for the Shared Signals receiver's calls to the
+    /// transmitter: its own client certificate and key (`ssf.clientCertificate`
+    /// and `ssf.clientKey`, e.g. one the identity provider's realm issued to
+    /// the application), else this service provider's key pair, which also
+    /// signs AuthnRequests and decrypts assertions. `idpCa` is the trust
+    /// anchor either way.
+    pub fn ssf_tls(&self) -> crate::http::TlsOptions {
+        let (cert, key) = match &self.ssf_client {
+            Some((cert, key)) => (cert.clone(), key.clone()),
+            None => (self.certificate_pem.clone(), self.private_key_pem.clone()),
+        };
+        crate::http::TlsOptions { cert, key, ca: self.idp_ca.clone() }
+    }
+
+    /// `ssf.clientKey` (PEM), when the receiver has a TLS client identity of its own.
+    pub(crate) fn ssf_client_key(&self) -> Option<&str> {
+        self.ssf_client.as_ref().map(|(_, key)| key.as_str())
+    }
+
+    /// Whether the receiver has a TLS client identity of its own
+    /// (`ssf.clientCertificate` / `ssf.clientKey`) rather than the SP key pair.
+    pub fn ssf_client_is_separate(&self) -> bool {
+        self.ssf_client.is_some()
+    }
+
     pub fn has(&self, key: &str) -> bool {
         key == "signals" && self.signals.is_some()
     }
 }
 
-fn expand(value: &str) -> Result<String, SamlError> {
+pub(crate) fn expand(value: &str) -> Result<String, SamlError> {
     let mut value = value.to_string();
     let mut seen = 0;
     loop {
@@ -209,6 +242,13 @@ pub fn resolve_config(config: &Map<String, Value>, base_dir: &str) -> Result<Con
     let want_assertions_signed = config.get("wantAssertionsSigned").map(|v| if v.is_null() { true } else { bool_or(v, true) }).unwrap_or(true);
     let want_assertions_encrypted = config.get("wantAssertionsEncrypted").map(|v| if v.is_null() { false } else { bool_or(v, false) }).unwrap_or(false);
     let allow_unsolicited = config.get("allowUnsolicited").map(|v| if v.is_null() { false } else { bool_or(v, false) }).unwrap_or(false);
+    let ssf_client = ssf_client(config.get("ssf"), &base)?;
+    #[cfg(feature = "pep")]
+    let pep = crate::pep::section(config, &base, &idp_ca)?;
+    #[cfg(not(feature = "pep"))]
+    if config.get("pep").is_some_and(|v| !v.is_null()) {
+        return Err(err("config", "pep is configured, and this build has no embedded PEP (the saml2-sp `pep` feature)"));
+    }
     let private_key_pem = private_pem(&private_key);
     Ok(Config {
         entity_id,
@@ -226,9 +266,38 @@ pub fn resolve_config(config: &Map<String, Value>, base_dir: &str) -> Result<Con
         idp_ca,
         idp_entity_id,
         name_id_format,
+        #[cfg(feature = "pep")]
+        pep,
         private_key,
         certificate_der,
+        ssf_client,
     })
+}
+
+/// `ssf.clientCertificate` and `ssf.clientKey`, read like `certificate` and
+/// `privateKey` (PEM text, a file path relative to the configuration, or an
+/// `env:` / `file:` placeholder). Both or neither; the pair must load as a
+/// TLS client identity (a PEM certificate chain and a PKCS#8 key of any type:
+/// a realm-issued EC P-256 key is the usual one). A key that is not the
+/// certificate's is refused by the TLS handshake, not here.
+fn ssf_client(ssf: Option<&Value>, base: &Path) -> Result<Option<(String, String)>, SamlError> {
+    let text = |name: &str| ssf.and_then(|block| block.get(name)).and_then(|v| v.as_str()).map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
+    for name in ["clientCertificate", "clientKey"] {
+        if ssf.and_then(|block| block.get(name)).is_some_and(|v| !v.is_null() && !v.is_string()) {
+            return Err(err("config", format!("ssf.{name} must be a PEM, a file path or a placeholder")));
+        }
+    }
+    match (text("clientCertificate"), text("clientKey")) {
+        (None, None) => Ok(None),
+        (Some(cert), Some(key)) => {
+            let cert = material(&cert, base, "ssf.clientCertificate")?;
+            let key = material(&key, base, "ssf.clientKey")?;
+            native_tls::Identity::from_pkcs8(cert.as_bytes(), key.as_bytes())
+                .map_err(|e| err("config", format!("ssf.clientCertificate and ssf.clientKey are not a usable TLS client identity: {e}")))?;
+            Ok(Some((cert, key)))
+        }
+        _ => Err(err("config", "ssf.clientCertificate and ssf.clientKey go together: give both, or neither to use the SP key pair")),
+    }
 }
 
 pub(crate) fn read_config_file(path: &str, overrides: Option<&Map<String, Value>>) -> Result<Config, SamlError> {

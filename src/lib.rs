@@ -15,6 +15,8 @@ mod http;
 mod jws;
 mod keys;
 mod metadata;
+#[cfg(feature = "pep")]
+pub mod pep;
 mod provider;
 mod receiver;
 mod replay;
@@ -28,12 +30,12 @@ pub use error::{SamlError, SamlStatus};
 pub use events::{caep_events, default_ending_events, default_events_requested, event, risc_events, subject_of};
 pub use http::TlsOptions;
 pub use jws::verify_compact_jws;
-pub use keys::{create_self_signed_key_pair, KeyMaterial};
+pub use keys::{create_self_signed_key_pair, create_self_signed_key_pair_for, service_provider_subject, CertificateSubject, KeyMaterial};
 pub use metadata::{metadata_document, read_idp_metadata, IdpMetadata};
 pub use provider::{AcsBody, LoginOptions, LoginRequest, ServiceProvider};
-pub use receiver::{Logger, ReceiverOptions, SignalEvent, SignalsReceiver};
+pub use receiver::{ssf_add_subjects, Logger, ReceiverOptions, SignalEvent, SignalsReceiver};
 pub use replay::MemoryReplayCache;
-pub use response::SamlLogin;
+pub use response::{SamlLogin, USERNAME_ATTRIBUTES};
 pub use session::{tracked_from, MemorySessionIndex, SessionRecord, DEFAULT_SUBJECT_ATTRIBUTE};
 
 #[cfg(test)]
@@ -48,3 +50,7 @@ mod plain_http_test;
 mod configure_test;
 #[cfg(test)]
 mod trust_chain_test;
+#[cfg(all(test, feature = "pep"))]
+mod pep_test;
+#[cfg(all(test, feature = "local"))]
+mod authzen_test;

@@ -76,6 +76,20 @@ impl MemorySessionIndex {
         drop_locked(&mut state, local_id);
     }
 
+    /// Removes `local_id` and answers its record, if it was tracked.
+    pub fn take(&self, local_id: &str) -> Option<SessionRecord> {
+        let mut state = self.sessions.lock().expect("sessions");
+        let found = state.sessions.get(local_id).cloned();
+        drop_locked(&mut state, local_id);
+        found
+    }
+
+    /// Whether `local_id` is tracked and has not expired.
+    pub fn contains(&self, local_id: &str) -> bool {
+        let state = self.sessions.lock().expect("sessions");
+        state.sessions.get(local_id).is_some_and(|s| s.expires_at_ms.map_or(true, |t| t > now_ms()))
+    }
+
     pub fn by_person(&self, person: &str) -> Vec<String> {
         self.find(|session| session.person == person)
     }

@@ -55,23 +55,70 @@ pub struct ServiceProvider {
     pub config: Config,
     pub idp: IdpMetadata,
     replay: MemoryReplayCache,
+    #[cfg(feature = "pep")]
+    pep: Option<std::sync::Arc<crate::pep::Pep>>,
 }
 
 impl ServiceProvider {
     /// Resolves `config` and loads the identity provider's metadata.
     pub fn create(config: &Map<String, Value>, base_dir: &str, replay: Option<MemoryReplayCache>) -> Result<Self, SamlError> {
-        let resolved = resolve_config(config, base_dir)?;
-        let mut sp = Self { config: resolved, idp: empty_idp(), replay: replay.unwrap_or_else(|| MemoryReplayCache::new(0)) };
-        sp.refresh_metadata()?;
-        Ok(sp)
+        Self::build(resolve_config(config, base_dir)?, replay)
     }
 
     /// Loads saml.json. Null override values are ignored.
     pub fn from_file(path: &str, overrides: Option<&Map<String, Value>>, replay: Option<MemoryReplayCache>) -> Result<Self, SamlError> {
-        let resolved = read_config_file(path, overrides)?;
-        let mut sp = Self { config: resolved, idp: empty_idp(), replay: replay.unwrap_or_else(|| MemoryReplayCache::new(0)) };
+        Self::build(read_config_file(path, overrides)?, replay)
+    }
+
+    fn build(config: Config, replay: Option<MemoryReplayCache>) -> Result<Self, SamlError> {
+        let mut sp = Self {
+            config,
+            idp: empty_idp(),
+            replay: replay.unwrap_or_else(|| MemoryReplayCache::new(0)),
+            #[cfg(feature = "pep")]
+            pep: None,
+        };
         sp.refresh_metadata()?;
+        // The embedded PEP (iya-sts#1206): built once the identity provider's
+        // entityID, its `pdpUrl` default, is known. `start` registers and (in
+        // local mode) pulls once; an unreachable service is retried on the
+        // PEP's own thread, and decisions are Unavailable until then.
+        #[cfg(feature = "pep")]
+        if let Some(section) = &sp.config.pep {
+            let pep = crate::pep::build(section, &sp.idp.entity_id, &sp.config.entity_id, &sp.config.private_key, sp.config.ssf_client_key())?;
+            pep.start().map_err(|e| err("config", e.message))?;
+            sp.pep = Some(pep);
+        }
         Ok(sp)
+    }
+
+    /// The embedded PEP, when the configuration has a `pep` section.
+    #[cfg(feature = "pep")]
+    pub fn pep(&self) -> Option<&std::sync::Arc<crate::pep::Pep>> {
+        self.pep.as_ref()
+    }
+
+    /// Decides one access for a validated sign-in with the embedded PEP. With
+    /// no `pep` section the answer is `Unavailable`: nothing here permits by
+    /// default.
+    #[cfg(feature = "pep")]
+    pub fn decide(&self, login: &SamlLogin, access: &crate::pep::Access) -> crate::pep::Decision {
+        match &self.pep {
+            Some(pep) => pep.decide(&crate::pep::subject_of(login), access),
+            None => crate::pep::Decision::Unavailable { why: "no pep section is configured".into() },
+        }
+    }
+
+    /// `decide` for the local session `local_id`, held in `sessions` (the
+    /// receiver's index: `SignalsReceiver::session_index`). A session that
+    /// ended (untracked at sign-out, expired, or ended by a CAEP or RISC event)
+    /// is denied without asking.
+    #[cfg(feature = "pep")]
+    pub fn decide_session(&self, sessions: &crate::session::MemorySessionIndex, local_id: &str, login: &SamlLogin, access: &crate::pep::Access) -> crate::pep::Decision {
+        if !sessions.contains(local_id) {
+            return crate::pep::Decision::Deny { why: "no signed-in session".into() };
+        }
+        self.decide(login, access)
     }
 
     fn tls(&self) -> Option<TlsOptions> {

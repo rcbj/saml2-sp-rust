@@ -8,13 +8,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
-RUN cargo test
+RUN cargo test && cargo test --all-features
 
 FROM rust:1
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src src
-RUN cargo build --release --bin saml2-sp --bin demo \
+RUN cargo build --release --features local --bin saml2-sp --bin demo \
  && cp target/release/saml2-sp /usr/local/bin/saml2-sp \
  && cp target/release/demo /usr/local/bin/saml-demo
 # demo/ comes after the build, so a new trust chain does not rebuild the binaries.
