@@ -97,7 +97,9 @@ fn ec_pem() -> String {
 }
 
 fn pep_section(pdp: &Pdp, tag: &str, extra: Value) -> Value {
-    let mut section = json!({"name": "pep-demo", "assertionKey": key_file(tag, &ec_pem()), "pdpUrl": pdp.url, "heartbeatIntervalMs": 60000});
+    // central by name: these tests ask the stub PDP for each decision, and
+    // a section that names no mode is local (iya-pep's default).
+    let mut section = json!({"name": "pep-demo", "mode": "central", "assertionKey": key_file(tag, &ec_pem()), "pdpUrl": pdp.url, "heartbeatIntervalMs": 60000});
     for (k, v) in extra.as_object().unwrap() {
         section[k] = v.clone();
     }
@@ -184,7 +186,7 @@ fn a_pep_section_builds_a_started_pep_with_the_librarys_defaults() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("pep-key.pem"), ec_pem()).unwrap();
     let ca = idp_key().certificate_pem.clone();
-    let config = test_config(extra(json!({"idpCa": ca, "pep": {"name": "pep-demo", "assertionKey": "file:pep-key.pem", "pdpUrl": pdp.url, "heartbeatIntervalMs": 60000}})), "");
+    let config = test_config(extra(json!({"idpCa": ca, "pep": {"name": "pep-demo", "mode": "central", "assertionKey": "file:pep-key.pem", "pdpUrl": pdp.url, "heartbeatIntervalMs": 60000}})), "");
     let sp = ServiceProvider::create(&config, &dir.to_string_lossy(), None).unwrap();
     assert_eq!(sp.pep().unwrap().config().tls_ca, ca);
     assert_eq!(sp.pep().unwrap().config().assertion_key, dir.join("pep-key.pem").to_string_lossy());
@@ -202,7 +204,7 @@ fn from_file_keeps_the_pep_section() {
     let dir = std::env::temp_dir().join(format!("saml2-sp-pep-from-file-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("pep-key.pem"), ec_pem()).unwrap();
-    let doc = test_config(extra(json!({"pep": {"name": "pep-demo", "assertionKey": "file:pep-key.pem", "pdpUrl": pdp.url, "heartbeatIntervalMs": 60000}})), "");
+    let doc = test_config(extra(json!({"pep": {"name": "pep-demo", "mode": "central", "assertionKey": "file:pep-key.pem", "pdpUrl": pdp.url, "heartbeatIntervalMs": 60000}})), "");
     let path = dir.join("saml.json");
     std::fs::write(&path, Value::Object(doc).to_string()).unwrap();
     let sp = ServiceProvider::from_file(&path.to_string_lossy(), None, None).unwrap();
@@ -221,10 +223,10 @@ fn a_bad_section_is_refused_at_create() {
         (json!({"pep": "on"}), "pep must be an object"),
         (json!({"pep": pep_section(&pdp, "bad-mode", json!({"mode": "remote"}))}), "pep.mode"),
         (json!({"pep": pep_section(&pdp, "bad-member", json!({"polIntervalMs": 1}))}), "polIntervalMs"),
-        (json!({"pep": {"name": "pep-demo", "pdpUrl": pdp.url}}), "assertionKey"),
-        (json!({"pep": {"name": "pep-demo", "assertionKey": "/nowhere.pem", "pdpUrl": pdp.url}}), "could not be read"),
+        (json!({"pep": {"name": "pep-demo", "mode": "central", "pdpUrl": pdp.url}}), "assertionKey"),
+        (json!({"pep": {"name": "pep-demo", "mode": "central", "assertionKey": "/nowhere.pem", "pdpUrl": pdp.url}}), "could not be read"),
         // An identity provider that is not iya-sts gives no pdpUrl to default to.
-        (json!({"idpMetadata": metadata_for("urn:example:idp"), "pep": {"name": "pep-demo", "assertionKey": key_file("urn", &ec_pem())}}), "name the service in pep.pdpUrl"),
+        (json!({"idpMetadata": metadata_for("urn:example:idp"), "pep": {"name": "pep-demo", "mode": "central", "assertionKey": key_file("urn", &ec_pem())}}), "name the service in pep.pdpUrl"),
     ] {
         let err = create(over).err().expect("refused");
         assert_eq!(err.code, "config");
@@ -237,7 +239,7 @@ fn the_pep_key_must_differ_from_the_service_providers_key() {
     let pdp = start_pdp();
     // privateKey signs requests, decrypts assertions and is the receiver's
     // TLS client key: the one key this library holds.
-    let same = json!({"name": "pep-demo", "assertionKey": key_file("same", &sp_key().private_key_pem), "pdpUrl": pdp.url});
+    let same = json!({"name": "pep-demo", "mode": "central", "assertionKey": key_file("same", &sp_key().private_key_pem), "pdpUrl": pdp.url});
     let err = create(json!({"pep": same})).err().expect("refused");
     assert_eq!(err.code, "config");
     assert!(err.message.contains("privateKey"), "{}", err.message);
@@ -245,7 +247,7 @@ fn the_pep_key_must_differ_from_the_service_providers_key() {
 
     // Another RSA key is fine.
     let other = create_self_signed_key_pair_pem();
-    let sp = create(json!({"pep": {"name": "pep-demo", "assertionKey": key_file("other", &other), "pdpUrl": pdp.url}})).unwrap();
+    let sp = create(json!({"pep": {"name": "pep-demo", "mode": "central", "assertionKey": key_file("other", &other), "pdpUrl": pdp.url}})).unwrap();
     assert!(sp.pep().is_some());
 }
 
@@ -478,4 +480,16 @@ fn local_mode_fails_closed_then_decides_in_process() {
     assert!(matches!(sp.decide(&login(), &Access::new("write", "order", "42")), Decision::Deny { .. }));
     assert_eq!(pdp.count("/access/v1/evaluation"), 0, "decided in process");
     assert!(pdp.count("/xacml/pep/policies") >= 2);
+}
+
+/// A `pep` section that names no mode is `local`: the PEP pulls the
+/// application's policies and decides in process.
+#[cfg(feature = "local")]
+#[test]
+fn a_section_without_a_mode_is_local() {
+    let pdp = start_pdp();
+    let mut section = pep_section(&pdp, "default-mode", json!({}));
+    section.as_object_mut().unwrap().remove("mode");
+    let sp = create(json!({"pep": section})).unwrap();
+    assert_eq!(sp.pep().unwrap().status().mode, crate::pep::Mode::Local);
 }

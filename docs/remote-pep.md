@@ -119,7 +119,7 @@ saml2-sp = { version = "…", features = ["pep"] }    # central
 saml2-sp = { version = "…", features = ["local"] }  # local (includes central)
 ```
 
-Without the feature a `pep` section is refused when the configuration is read, rather than silently ignored.
+Without the feature a `pep` section is refused when the configuration is read, rather than silently ignored. A section that names no `mode` is `local`, so a build with `pep` alone must say `"mode": "central"`; it refuses a section that leaves the mode out.
 
 ## Configure
 
@@ -136,7 +136,7 @@ Add a `pep` section to `saml.json`. The PEP is off unless it is present.
 | Member | Default here | What it is |
 |---|---|---|
 | `name` | required | The PEP's service account (step 2). |
-| `mode` | `central` | `central` or `local`. |
+| `mode` | `local` | `local` (the PEP pulls its application's policies, caches them in memory and decides in process) or `central` (it asks iya-sts for every decision). |
 | `assertionKey` | required | The PEP's private key in PEM: a path; a relative one is read from the configuration file's directory, like `privateKey`. The file is re-read when it changes. |
 | `pdpUrl` | the identity provider's entityID. iya-sts's SAML entityID is the realm's issuer, so this is the service's URL with the realm prefix | iya-sts, with `/realm/<id>` for a realm. |
 | `application` | `entityId` | The application the PEP is bound to (step 3). |
@@ -239,7 +239,7 @@ The live run found two differences, both about an application that enforces fine
 
 Built with `local` (the Dockerfile does), the demo protects `GET /orders/<id>` with the PEP when `demo/saml.json` has a `pep` section: 401 without a sign-in, 200 on a Permit, 403 on a Deny and 503 on `Unavailable`.
 
-One command sets the demo up with its PEP: the install script with `--pep central` or `--pep local` (and `--pep-name`, default `pep-saml-demo`). After registering the service provider it does steps 2 to 6: the service account in `remote-peps`; a P-256 key made with `openssl` in `demo/generated/pep-key.pem` (0600, never printed, never in the image), certified and bound to the demo's application; the catalogue row `subject.acr` (`AuthnContextClassRef`, as `urn:saml-sp-demo:acr`); and the demo application's own policy, which it enforces, permitting `read` on an `order` when the sign-in carried an `AuthnContextClassRef` and denying everything else. The realm root is never touched. It then writes the `pep` section (`name`, `mode`, `assertionKey: generated/pep-key.pem`) into `demo/saml.json`, keeping the other members. `--dry-run` lists every call.
+One command sets the demo up with its PEP: the install script with `--pep local` (or a bare `--pep`, local being the default) or `--pep central` (and `--pep-name`, default `pep-saml-demo`). After registering the service provider it does steps 2 to 6: the service account in `remote-peps`; a P-256 key made with `openssl` in `demo/generated/pep-key.pem` (0600, never printed, never in the image), certified and bound to the demo's application; the catalogue row `subject.acr` (`AuthnContextClassRef`, as `urn:saml-sp-demo:acr`); and the demo application's own policy, which it enforces, permitting `read` on an `order` when the sign-in carried an `AuthnContextClassRef` and denying everything else. The realm root is never touched. It then writes the `pep` section (`name`, `mode`, `assertionKey: generated/pep-key.pem`) into `demo/saml.json`, keeping the other members. `--dry-run` lists every call.
 
 ```sh
 docker compose build

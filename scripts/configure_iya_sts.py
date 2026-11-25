@@ -10,7 +10,7 @@ It writes iya-sts's listener CA trust chain (leaf, TLS Issuing CA, Intermediate,
 idpCa names, every run. The demo image build copies that file in, so rebuild the image after running
 this against a different iya-sts.
 
---pep central|local also sets the demo up with its embedded PEP (docs/remote-pep.md, steps 2 to 6):
+--pep [local|central] (local when left out) also sets the demo up with its embedded PEP (docs/remote-pep.md, steps 2 to 6):
 the PEP's service account in remote-peps; a P-256 key made here with openssl in generated/pep-key.pem
 beside the configuration (0600, never printed, kept out of the image by .dockerignore), certified from
 its own request with the PEP bound to the demo's application; the catalogue row the demo's policy reads;
@@ -89,7 +89,7 @@ def orders_policy(namespace: str = "samlspdemo", read_effect: str = "permit") ->
 def usage() -> str:
     return """Usage: python scripts/configure_iya_sts.py [--config path] [--idp url] [--public-url url]
                                         [--test-user name | --no-test-user]
-                                        [--pep central|local] [--pep-name name] [--dry-run]
+                                        [--pep [local|central]] [--pep-name name] [--dry-run]
 
   --config        The demo's SAML configuration (default: demo/saml.json)
   --idp           iya-sts's base URL; the realm's, e.g. https://host/realm/acme, for a trust realm
@@ -103,7 +103,8 @@ def usage() -> str:
                   path is printed. With $SAML_DEMO_USER_PASSWORD set, an existing user's
                   password is replaced.
   --no-test-user  Do not create a test user.
-  --pep           Also set up the demo's embedded PEP in this mode (central or local): its service
+  --pep [MODE]    Also set up the demo's embedded PEP in this mode, local (the default: it caches
+                  the application's policies and decides in process) or central: its service
                   account, a key of its own in generated/pep-key.pem (0600), its certificate and
                   binding, the catalogue row, the demo application's own policy (enforced), and the
                   `pep` section in the configuration. Safe to run again; the mode is switched.
@@ -219,7 +220,12 @@ def parse_args(argv: list[str], env: dict | None = None) -> Args:
         elif arg == "--no-test-user":
             out.test_user = ""
         elif arg == "--pep":
-            out.pep = value().strip()
+            # The mode may be left out: then local, iya-pep's default (the
+            # PEP caches the application's policies and decides in process).
+            if index + 1 < len(argv) and not argv[index + 1].startswith("--"):
+                out.pep = value().strip()
+            else:
+                out.pep = "local"
             if out.pep not in PEP_MODES:
                 raise SystemExit(f"--pep must be central or local, not {out.pep}")
         elif arg == "--pep-name":
