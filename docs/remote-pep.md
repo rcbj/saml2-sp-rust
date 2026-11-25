@@ -2,7 +2,7 @@
 
 This library can ask iya-sts's authorization policy whether a signed-in person (a validated `SamlLogin`) may do something to a resource in your application, through an embedded **Remote PEP** (Policy Enforcement Point). The PEP itself is the shared [`iya-pep`](https://github.com/rcbj/iya-pep-rust) crate; this library builds it from your configuration, turns its SAML 2.0 sign-in into the PEP's subject, and hands it policy-change events from its Shared Signals stream. The design is [iya-sts #1206](https://github.com/rcbj/iya-sts/issues/1206).
 
-The PEP never permits by default. A decision is `Permit`, `Deny` or `Unavailable`, and `Unavailable` (no policy held yet, or iya-sts unreachable) must be treated as a refusal.
+The PEP never permits by default. A decision is `Permit`, `Deny` or `Unavailable`, and `Unavailable` (no policy held yet, iya-sts unreachable, or a panic while deciding, which the PEP catches and notes) must be treated as a refusal. Every PEP failure is a refusal: `decision.http_status()` is 200 for a Permit and 403 for a Deny and for `Unavailable` alike, never a 5xx a client might retry into a different answer. Whether the person is signed in at all (401) is your application's question, asked before the PEP's.
 
 ## Choosing a mode
 
@@ -11,7 +11,7 @@ The PEP never permits by default. A decision is `Permit`, `Deny` or `Unavailable
 | Who decides | iya-sts, per request (`POST /access/v1/evaluation`) | this process, with the PEP's own XACML engine |
 | Cargo feature | `pep` | `local` |
 | Latency | one HTTPS round trip per decision | none after the first pull |
-| When iya-sts is down | every decision is `Unavailable` | decisions continue with the policies held |
+| When iya-sts is down | every decision is `Unavailable`, and the Permit cache (if on) is emptied | decisions continue with the policies held |
 | Policy changes | at once | on the `pep-policies-changed` event, or the next poll |
 | Decision records | written by iya-sts | sent by the PEP to iya-sts's audit log |
 
@@ -30,7 +30,7 @@ api() { curl -s -H "Authorization: Bearer $TOKEN" \
 
 Register the service provider in iya-sts as usual; `scripts/configure_iya_sts.py` does it for the demo. Note its identifier: it is the `application` the PEP is bound to (`entityId` by default).
 
-For the demo, `scripts/configure_iya_sts.py --pep central` (or `local`) does this step and steps 2 to 6 in one run; see *The demo* below.
+For the demo, `scripts/configure_iya_sts.py --pep local` (a bare `--pep` is `local` too) or `--pep central` does this step and steps 2 to 6 in one run; see *The demo* below.
 
 ### 2. Create the PEP's service account
 
@@ -145,7 +145,7 @@ Add a `pep` section to `saml.json`. The PEP is off unless it is present.
 | `pollIntervalMs` | 15000 | `local` without a signal stream. |
 | `fallbackPollMs` | 300000 | `local` with one, in case an event is lost. |
 | `heartbeatIntervalMs` | 30000 | How often the PEP reports to iya-sts. |
-| `permitCacheMs` | 0 (off) | `central` only: reuse a Permit for this long, at most 60000. The policy-change event clears it. |
+| `permitCacheMs` | 0 (off) | `central` only: reuse a Permit for this long, at most 60000. The policy-change event clears it, and so does a failed evaluation or a failed heartbeat: no cached Permit is served until iya-sts answers an evaluation again, so an outage does not keep a Permit alive. |
 | `supportedObligations` | `[]` | The obligation types your application discharges (see *Obligations*). |
 | `decisionRecords` | `true` | `local`: send each decision to iya-sts's audit log. |
 | `tlsCa` | `idpCa` | PEM trust anchors for iya-sts's TLS. |
@@ -172,6 +172,8 @@ match decision {
 }
 // Without a receiver: sp.decide(&login, &access)
 ```
+
+`http_status()` is the rule rather than a convention: answer with it and a Deny, a decision that couldn't be made and a panic inside the PEP are all 403. The demo's two protected pages take their status from it.
 
 `Access::new(action, resource_type, resource_id)` carries the AuthZEN action and resource. Add `resource_properties`, `action_properties` or `context` members as your policy needs them, each declared in the catalogue (step 4). The PEP always sets `context.application` to the bound application, whatever you put there.
 
@@ -239,7 +241,7 @@ The live run found two differences, both about an application that enforces fine
 
 ## The demo
 
-Built with `local` (the Dockerfile does), the demo protects `GET /orders/<id>` with the PEP when `demo/saml.json` has a `pep` section: 401 without a sign-in, 200 on a Permit, and 403 on a Deny and on `Unavailable` (any PEP failure is a 403: the page says the PEP could not decide).
+Built with `local` (the Dockerfile does), the demo protects `GET /orders/<id>` with the PEP when `demo/saml.json` has a `pep` section (`read`; any other method is `write`, which the demo's policy denies): 401 without a sign-in, then the decision's `http_status()`: 200 on a Permit, and 403 on a Deny and on `Unavailable` (any PEP failure is a 403: the page says whether the PEP denied it or could not decide). With no service provider to ask (the configuration doesn't load) it is 403 too.
 
 `GET /attribute-protected` is decided by the PEP too (`Access::new("read", "attribute-protected", "attr1")`): 200 when the person's directory attribute `attr1` is `abc123`, which the PEP asks iya-sts's PIP for (`urn:sts:xacml:attribute:attr1`; the assertion does not carry it), and 403 otherwise.
 
@@ -253,9 +255,9 @@ docker run --rm --network host --user "$(id -u):$(id -g)" -e HOME=/tmp \
 docker compose up --build
 ```
 
-Run it again against the same iya-sts to switch the mode: the account and the key are kept, and so is a policy an administrator wrote, and the PEP is bound again. Against a new iya-sts the kept key is certified there. `GET /live-status` shows the PEP's `status()` under `pep`.
+Run it again against the same iya-sts to switch the mode: the account and the key are kept, and so is a policy an administrator wrote, and the PEP is bound again. Against a new iya-sts the kept key is certified there. `GET /live-status` shows the PEP's `status()` under `pep`. The image copies `demo/saml.json` in when it is built, so rebuild after the script writes the section (`docker compose up --build`); Compose mounts `demo/generated` read-only, which holds the PEP's key.
 
-The signed-in page has three tabs: **Session**, **CAEP & RISC events** and **Policy enforcement** (`/?tab=pep`), the embedded PEP's `status()` as four collapsible panes (Decisions, Cached policy, The PEP, Control plane) and a **Try it** pane linking `/orders/42` and `/attribute-protected`, redrawn every 2 s by `demo/public/pep.js` from `GET /pep-status.html`, which keeps a pane you closed closed; `GET /pep-status` is the same as JSON. Both need a sign-in and carry nothing secret. Without a `pep` section the tab says there is no embedded PEP.
+The signed-in page has three tabs: **Session**, **CAEP & RISC events** and **Policy enforcement** (`/?tab=pep`), the last showing the embedded PEP's `status()` as four collapsible panes (Decisions, Cached policy, The PEP, Control plane) and a **Try it** pane linking `/orders/42` and `/attribute-protected`, redrawn every 2 s by `demo/public/pep.js` from `GET /pep-status.html`, which keeps a pane you closed closed; `GET /pep-status` is the same as JSON. Both need a sign-in and carry nothing secret. Without a `pep` section the tab says there is no embedded PEP.
 
 ## See also
 

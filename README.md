@@ -12,7 +12,7 @@ let request = sp.login(&saml2_sp::LoginOptions { relay_state: Some("/home".into(
 let who = sp.acs(method, raw_url, &saml2_sp::AcsBody::Text(body), &[request.id])?;
 ```
 
-The crate is `saml2-sp`. `saml.json` uses the same keys as the Python service provider: `entityId`, `acsUrl`, `privateKey`, `certificate`, `idpMetadata`, and the optional `requestBinding`, `responseBinding`, `idpCa`, `idpEntityId`, `nameIdFormat`, `clockSkewSeconds`, `wantAssertionsSigned`, `wantAssertionsEncrypted`, `allowUnsolicited`, and `signals`. A value may be PEM text, a file path, or an `env:` / `file:` placeholder. `signals` omitted or `true` leaves the Shared Signals receiver available and is omitted from the resolved configuration. `false` turns it off, does not require transmitter metadata, and is stored as `signals: false`. Any other value is a configuration error: `signals must be true or false`. SAML does not send OAuth scopes, so the flag does not change the `AuthnRequest`.
+The crate is `saml2-sp`. `saml.json` uses the same keys as the Python service provider: `entityId`, `acsUrl`, `privateKey`, `certificate`, `idpMetadata`, and the optional `requestBinding`, `responseBinding`, `idpCa`, `idpEntityId`, `nameIdFormat`, `clockSkewSeconds`, `wantAssertionsSigned`, `wantAssertionsEncrypted`, `allowUnsolicited`, `signals`, and (with the `pep` feature) `pep`. A value may be PEM text, a file path, or an `env:` / `file:` placeholder. `signals` omitted or `true` leaves the Shared Signals receiver available and is omitted from the resolved configuration. `false` turns it off, does not require transmitter metadata, and is stored as `signals: false`. Any other value is a configuration error: `signals must be true or false`. SAML does not send OAuth scopes, so the flag does not change the `AuthnRequest`.
 
 `login` returns a redirect URL or `post_form_html` fields. `acs` accepts a POST body as text or a list of fields. Artifact resolution is a signed SOAP `ArtifactResolve`. HTTP-Redirect query signatures use RSA-SHA256 (`http://www.w3.org/2001/04/xmldsig-more#rsa-sha256`). Success is `urn:oasis:names:tc:SAML:2.0:status:Success`.
 
@@ -57,14 +57,16 @@ saml2-sp = { version = "…", features = ["local"] }  # local too: decided in pr
 ```
 
 ```rust
-match sp.decide_session(&receiver.session_index(), &local_id, &login, &Access::new("read", "order", "42")) {
+let decision = sp.decide_session(&receiver.session_index(), &local_id, &login, &Access::new("read", "order", "42"));
+let status = decision.http_status(); // 200 for a Permit, 403 for anything else
+match decision {
     Decision::Permit { obligations, .. } => { /* discharge them, then serve */ }
     Decision::Deny { .. } => { /* 403 */ }
     Decision::Unavailable { .. } => { /* 403: fail closed, never a Permit */ }
 }
 ```
 
-The section is off unless present, and a build without the feature refuses it. A section that names no `mode` is `local`; a build with `pep` alone must name `"mode": "central"`. The PEP's key must be its own, and only the claims the realm's AuthZEN catalogue declares are sent. The demo protects `GET /orders/<id>` with the PEP.
+The section is off unless present, and a build without the feature refuses it. A section that names no `mode` is `local`; a build with `pep` alone must name `"mode": "central"`. The PEP's key must be its own, and only the claims the realm's AuthZEN catalogue declares are sent. The subject's id is the username from the assertion's attributes (`SamlLogin::username()`), else the NameID. Every PEP failure is a 403: a panic while deciding is `Unavailable`, `http_status()` is 403 for it as for a Deny, and in `central` mode a failed evaluation or heartbeat empties the Permit cache. The receiver, given the PEP (`ReceiverOptions::pep`), asks its stream for `pep-policies-changed` and tells the PEP whether the stream is up, so a `local` PEP polls while it cannot hear. The demo protects `GET /orders/<id>` and `GET /attribute-protected` with the PEP.
 
 ## The demo with its embedded PEP
 
@@ -86,7 +88,7 @@ docker compose up --build
 docker build --target test .
 ```
 
-The suite runs in a container.
+The suite runs in a container: `cargo test`, then `cargo test --all-features` (the embedded PEP). It includes the demo's own tests (`src/bin/demo.rs`) and the install script's (`src/configure_test.rs`, which runs the script's functions with fakes under `python3`).
 
 **AuthZEN cases (the embedded PEP).** `src/authzen/cases.json` is this library's own table: catalogue rows, policies (`src/authzen/*.alfa`, given to iya-sts, and `*.xml`, what iya-sts stored for them), a directory person, and 45 cases, each a `SamlLogin`, an `Access` and the answer the host must see (Permit with its obligations, Deny or Unavailable). `src/authzen_test.rs` runs them in the suite through a `local` ServiceProvider against a stub PDP. `IYA_STS_IMAGE=<image> python3 scripts/live_authzen.py` runs them live: it registers this SP on a fresh iya-sts, provisions a `central` and a `local` PEP (each its own key, bound to the SP), the rows and the policies, and requires every case to answer the same in both modes and as the table says. On 2026-11-24 all 45 answered the same in both modes and as the table says (see [docs/remote-pep.md](docs/remote-pep.md#testing-central-against-local)).
 
