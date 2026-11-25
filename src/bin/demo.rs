@@ -49,6 +49,8 @@ struct App {
     secure_cookies: bool,
     ssf_transmitter: String,
     ssf_poll_ms: u64,
+    /// `ssf.addSubjects` (default true): Add/Remove Subject at sign-in and sign-out.
+    ssf_add_subjects: bool,
     receiver: Arc<Mutex<Option<SignalsReceiver>>>,
     receiver_state: Arc<Mutex<String>>,
     sessions: Arc<Mutex<HashMap<String, Held>>>,
@@ -149,6 +151,7 @@ fn configure() -> Result<App, String> {
     if signals_off { receiver_state = "not configured (signals are off)".to_string(); }
     let mut ssf_transmitter = String::new();
     let mut ssf_poll_ms = 0u64;
+    let ssf_add_subjects = saml2_sp::ssf_add_subjects(file.get("ssf")).map_err(|e| e.to_string())?;
     if let Some(ssf) = file.get("ssf").and_then(|v| v.as_object()) {
         if !signals_off {
             ssf_transmitter = ssf.get("transmitter").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -162,7 +165,7 @@ fn configure() -> Result<App, String> {
     }
     let secure_cookies = secure_from(&endpoints_of(&file, port, public_given, &public_url).1, port);
     Ok(App {
-        port, public_url, public_given, config_path, secret, secure_cookies, ssf_transmitter, ssf_poll_ms,
+        port, public_url, public_given, config_path, secret, secure_cookies, ssf_transmitter, ssf_poll_ms, ssf_add_subjects,
         receiver: Arc::new(Mutex::new(None)), receiver_state: Arc::new(Mutex::new(receiver_state)), sessions: Arc::new(Mutex::new(HashMap::new())),
         events: Arc::new(Mutex::new(Vec::new())), event_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         sp: OnceLock::new(),
@@ -248,6 +251,7 @@ fn start_receiver(app: &App, sp: &ServiceProvider) {
         tls: Some(tls),
         description: format!("saml2-sp demo ({entity})"),
         poll_interval_ms: app.ssf_poll_ms,
+        add_subjects: app.ssf_add_subjects,
         // The embedded PEP's policy events ride this stream (the `pep` feature).
         #[cfg(feature = "pep")]
         pep: sp.pep().cloned(),
@@ -1061,18 +1065,26 @@ fn acs(app: &App, req: &Request) -> Response {
             response
         }
         Ok(login) => {
-            let sid = b64url(&random(32));
-            let mut until = now_ms() + SESSION_MS;
-            if let Some(limit) = login.session_not_on_or_after_ms {
-                if limit < until { until = limit; }
-            }
-            app.sessions.lock().expect("sessions").insert(sid.clone(), Held { login: login.clone(), expires_ms: until });
-            if let Some(receiver) = app.receiver.lock().expect("receiver").as_ref() { receiver.track(&sid, &login, Some(until)); }
+            let (sid, until) = remember_sign_in(app, &login);
             println!("signed in {} by {} (assertion {})", login.name_id, login.binding, login.assertion_id);
             let max_age = ((until - now_ms()) / 1000).max(0) as i64;
             Response { status: 303, headers: vec![("location".into(), "/".into()), ("set-cookie".into(), clear), ("set-cookie".into(), cookie("sid", &sid, "/", max_age, "Lax", app.secure_cookies))], body: Vec::new() }
         }
     }
+}
+
+/// A new local session for a validated sign-in: EVERY sign-in is tracked by
+/// the receiver (so an event about that person can end it, and Add Subject
+/// tells the transmitter about them), not only the one that started it.
+fn remember_sign_in(app: &App, login: &SamlLogin) -> (String, i64) {
+    let sid = b64url(&random(32));
+    let mut until = now_ms() + SESSION_MS;
+    if let Some(limit) = login.session_not_on_or_after_ms {
+        if limit < until { until = limit; }
+    }
+    app.sessions.lock().expect("sessions").insert(sid.clone(), Held { login: login.clone(), expires_ms: until });
+    if let Some(receiver) = app.receiver.lock().expect("receiver").as_ref() { receiver.track(&sid, login, Some(until)); }
+    (sid, until)
 }
 
 fn logout(app: &App, req: &Request) -> Response {
@@ -1245,7 +1257,7 @@ mod tests {
     fn app() -> App {
         App {
             port: 0, public_url: String::new(), public_given: false, config_path: "/nonexistent/saml.json".into(), secret: vec![7; 32],
-            secure_cookies: false, ssf_transmitter: String::new(), ssf_poll_ms: 0, receiver: Arc::new(Mutex::new(None)),
+            secure_cookies: false, ssf_transmitter: String::new(), ssf_poll_ms: 0, ssf_add_subjects: true, receiver: Arc::new(Mutex::new(None)),
             receiver_state: Arc::new(Mutex::new(String::new())), sessions: Arc::new(Mutex::new(HashMap::new())), events: Arc::new(Mutex::new(Vec::new())),
             event_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)), sp: OnceLock::new(),
         }
@@ -1309,6 +1321,51 @@ mod tests {
         let page = route(&app, &get("/"));
         let csp = page.headers.iter().find(|(k, _)| k == "content-security-policy").map(|(_, v)| v.clone()).unwrap_or_default();
         assert!(csp.contains("connect-src 'self'"), "pep.js may fetch the fragment: {csp}");
+    }
+
+    #[test]
+    fn signals_off_starts_no_receiver_so_no_subject_is_added() {
+        // A transmitter that would be reached (and counted) if anything were sent.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut app = app();
+        app.ssf_transmitter = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        start_receiver(&app, &sp_with(None));
+        assert!(app.receiver.lock().unwrap().is_none(), "signals: false builds no receiver");
+        assert_eq!(*app.receiver_state.lock().unwrap(), "not configured (signals are off)");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(listener.accept().is_err(), "nothing dialled the transmitter");
+        assert!(saml2_sp::ssf_add_subjects(Some(&json!({"addSubjects": "yes"}))).is_err());
+        assert_eq!(saml2_sp::ssf_add_subjects(Some(&json!({"addSubjects": false}))).ok(), Some(false));
+        assert_eq!(saml2_sp::ssf_add_subjects(None).ok(), Some(true));
+    }
+
+    #[test]
+    fn every_sign_in_is_tracked_by_the_receiver_and_sign_out_untracks_it() {
+        let app = app();
+        let receiver = SignalsReceiver::new(ReceiverOptions {
+            transmitter: "http://127.0.0.1:1".into(), on_end_sessions: Some(Arc::new(|_, _| Ok(()))), ..ReceiverOptions::default()
+        }).unwrap();
+        *app.receiver.lock().unwrap() = Some(receiver.clone());
+        let mut bob = alice();
+        for values in bob.attributes.values_mut() { *values = values.iter().map(|v| v.replace("alice", "bob")).collect(); }
+        bob.attributes.insert(saml2_sp::DEFAULT_SUBJECT_ATTRIBUTE.into(), vec!["urn:uuid:bob".into()]);
+        let mut alice = alice();
+        alice.attributes.insert(saml2_sp::DEFAULT_SUBJECT_ATTRIBUTE.into(), vec!["urn:uuid:alice".into()]);
+        let (first, _) = remember_sign_in(&app, &alice);
+        let (second, _) = remember_sign_in(&app, &bob);
+        let (third, _) = remember_sign_in(&app, &alice);
+        let index = receiver.session_index();
+        for sid in [&first, &second, &third] {
+            assert!(index.contains(sid), "every sign-in is tracked, not only the first");
+        }
+        assert_eq!(index.by_person("urn:uuid:alice").len(), 2);
+        assert_eq!(index.by_email("bob@example.com"), vec![second.clone()]);
+        let mut out = get("/logout");
+        out.method = "POST".into();
+        out.headers.insert("cookie".into(), format!("sid={second}"));
+        assert_eq!(route(&app, &out).status, 303);
+        assert!(!index.contains(&second) && index.contains(&first) && index.contains(&third), "sign-out untracks that session only");
     }
 
     #[test]
