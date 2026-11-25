@@ -135,7 +135,9 @@ def main():
         client = live.Client(ca_file)
         token = live.mint_admin(client, sts_origin, secret)
         live.make_denied_user(client, sts_origin, token, denied_password)
-        mounts = [(demo_dir / "generated" / name, f"/app/demo/generated/{name}") for name in ("sp.key", "sp.crt", "idp-metadata.xml")]
+        # The receiver's realm-issued TLS client certificate (the install script's, with signals on).
+        mounts = [(demo_dir / "generated" / name, f"/app/demo/generated/{name}") for name in ("sp.key", "sp.crt", "idp-metadata.xml", "ssf-client.key", "ssf-client.crt")
+                  if name not in ("ssf-client.key", "ssf-client.crt") or (demo_dir / "generated" / name).exists()]
         mounts.append((pep_key, "/app/demo/" + PEP_KEY))
         live.start_demo(IMAGE, DEMO_NAME, demo_port, demo_origin, mounts)
         pep = wait_pep(demo_origin)

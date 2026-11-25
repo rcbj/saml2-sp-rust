@@ -50,6 +50,19 @@ MULTIPLE_ACCOUNTS = {"key": "authn.multipleAccounts", "value": True}
 # The embedded PEP (--pep). PEP_KEY is relative to the configuration's directory, and the `pep`
 # section names it that way too: this library reads a relative assertionKey from there, as it reads
 # privateKey.
+# The SP key pair's certificate subject: a name a person recognises in iya-sts's console,
+# with the entityID as its subjectAltName URI (saml2-sp generate-keys adds O=saml2-sp).
+SP_CERT_CN = "saml2-sp-rust demo SP"
+# The Shared Signals receiver's own TLS client identity: a certificate the realm issues the
+# application (urn:sts:application:<entityID>), beside the configuration, written into its
+# ssf block as clientCertificate / clientKey. Separate from the SAML signing/encryption key.
+SSF_CLIENT_KEY = "generated/ssf-client.key"
+SSF_CLIENT_CERT = "generated/ssf-client.crt"
+SSF_CLIENT_LABEL = "saml2-sp demo SSF"
+# SHA-256 fingerprints of SP certificates --new-sp-keys replaced: their old trust anchors and
+# stored copies are taken off iya-sts once the realm-issued certificate is in place.
+RETIRED_SP_CERTS = "generated/retired-sp-certificates.txt"
+
 PEP_MODES = ("central", "local")
 PEP_NAME = "pep-saml-demo"
 PEP_KEY = "generated/pep-key.pem"
@@ -116,7 +129,8 @@ def orders_policy(namespace: str = "samlspdemo", read_effect: str = "permit") ->
 def usage() -> str:
     return """Usage: python scripts/configure_iya_sts.py [--config path] [--idp url] [--public-url url]
                                         [--test-user name | --no-test-user]
-                                        [--pep [local|central]] [--pep-name name] [--dry-run]
+                                        [--pep [local|central]] [--pep-name name] [--new-sp-keys]
+                                        [--dry-run]
 
   --config        The demo's SAML configuration (default: demo/saml.json)
   --idp           iya-sts's base URL; the realm's, e.g. https://host/realm/acme, for a trust realm
@@ -136,6 +150,20 @@ def usage() -> str:
                   binding, the catalogue row, the demo application's own policy (enforced), and the
                   `pep` section in the configuration. Safe to run again; the mode is switched.
   --pep-name      The PEP's service account (default: pep-saml-demo).
+  --new-sp-keys   Replace the SP key pair (signing and encryption) with a new one named
+                  CN=saml2-sp-rust demo SP, O=saml2-sp, URI:<entityID>, and register the new
+                  metadata. The old certificate's fingerprint is kept in
+                  generated/retired-sp-certificates.txt so its trust anchor and stored copy are
+                  taken off iya-sts.
+
+With an ssf block (signals on), the Shared Signals receiver authenticates to iya-sts's /ssf/*
+with a TLS client certificate the realm issues the application (issue-tls-client-certificate,
+urn:sts:application:<entityID>): generated/ssf-client.key (0600, never printed) and
+generated/ssf-client.crt, named in the configuration's ssf.clientKey / ssf.clientCertificate.
+A certificate the realm still lists for the application is kept on later runs. The SP's own
+certificate is no longer added to iya-sts's client-certificate truststore; an anchor an
+earlier run added (and the copy stored on the application) is removed once the new
+certificate is in place.
   --dry-run       Print what would be done, and send nothing.
 
 The management API secret is ADMIN_API_CLIENT_SECRET or STS_ADMIN_API_CLIENT_SECRET."""
@@ -219,6 +247,7 @@ def parse_args(argv: list[str], env: dict | None = None) -> Args:
         test_user="saml-demo-user",
         pep="",
         pep_name=PEP_NAME,
+        new_sp_keys=False,
         dry_run=False,
         help=False,
     )
@@ -259,6 +288,8 @@ def parse_args(argv: list[str], env: dict | None = None) -> Args:
             out.pep_name = value().strip()
             if not out.pep_name:
                 raise SystemExit("--pep-name is empty")
+        elif arg == "--new-sp-keys":
+            out.new_sp_keys = True
         elif arg == "--dry-run":
             out.dry_run = True
         else:
@@ -373,7 +404,7 @@ def plan_for(files: DemoFiles, base: str, test_user: str, sp_metadata_xml: str) 
         calls.insert(2, {"method": "POST", "path": f"{base}/admin-api/applications/set", "why": f"encrypt the assertion: {attribute}",
                          "body": {"application": files.entity_id, "attribute": attribute, "value": value}})
     if files.ssf_transmitter:
-        calls[-1:-1] = ssf_calls(files, base, "<the SP certificate>")
+        calls[-1:-1] = ssf_calls(files, base) + ssf_client_plan(files, base)
     if test_user:
         calls.append({"method": "POST", "path": f"{base}/admin-api/users/create", "why": f"create the test user {test_user}", "body": {"username": test_user}})
         calls.append({"method": "POST", "path": f"{base}/admin-api/policies/define-person-attribute",
@@ -428,17 +459,200 @@ def set_test_attribute(call, user: str) -> bool:
     return False
 
 
-def ssf_calls(files: DemoFiles, base: str, certificate_pem: str) -> list[dict]:
+def ssf_calls(files: DemoFiles, base: str) -> list[dict]:
+    """What lets the application manage its Shared Signals stream: the scope it declares and
+    SSF_MANAGE, which authorizes it. Its TLS client certificate is the realm's
+    (`issue_ssf_client_certificate`); nothing goes into the process-wide truststore."""
     return [
         {"method": "POST", "path": f"{base}/admin-api/applications/add", "why": "declare the Shared Signals write scope",
          "body": {"application": files.entity_id, "attribute": "oauthAllowedScope", "value": "ssf.manage"}},
         {"method": "POST", "path": f"{base}/admin-api/roles/add-member", "why": "hold SSF_MANAGE, which authorizes it",
          "body": {"role": "SSF_MANAGE", "kind": "application", "member": files.entity_id}},
-        {"method": "POST", "path": f"{base}/admin-api/tls/trust/add", "why": "trust the SP certificate at the TLS handshake",
-         "body": {"certificates": certificate_pem}},
-        {"method": "POST", "path": f"{base}/admin-api/applications/add-certificate", "why": "store the SP certificate on the application",
-         "body": {"application": files.entity_id, "certificate": certificate_pem}},
     ]
+
+
+def ssf_client_plan(files: DemoFiles, base: str) -> list[dict]:
+    """--dry-run's view of the receiver's TLS client certificate and the clean-up after it."""
+    return [
+        {"method": "GET", "path": f"{base}/admin-api/applications?application={urllib.parse.quote(files.entity_id, safe='')}",
+         "why": f"keep {SSF_CLIENT_CERT} when the realm still lists it for the application", "body": None},
+        {"method": "POST", "path": f"{base}/admin-api/applications/issue-tls-client-certificate",
+         "why": f"(otherwise) the realm issues the receiver its TLS client certificate: {SSF_CLIENT_KEY} (0600), {SSF_CLIENT_CERT}",
+         "body": {"application": files.entity_id, "password": "<one-time>", "keyAlg": "ec-p256", "label": SSF_CLIENT_LABEL}},
+        {"method": "POST", "path": f"{base}/admin-api/tls/trust/remove",
+         "why": "take off the SP certificate's trust anchor an earlier run added (if held)", "body": {"fingerprint": "<the SP certificate's SHA-256>"}},
+        {"method": "POST", "path": f"{base}/admin-api/applications/remove-certificate",
+         "why": "and its copy stored on the application (if stored)", "body": {"application": files.entity_id, "sha256": "<the SP certificate's SHA-256>"}},
+    ]
+
+
+def _pem_blocks(text: str) -> list[str]:
+    return re.findall(r"-----BEGIN CERTIFICATE-----[A-Za-z0-9+/=\s]+?-----END CERTIFICATE-----", text or "")
+
+
+def _same_pem(a: str, b: str) -> bool:
+    return re.sub(r"\s+", "", a or "") == re.sub(r"\s+", "", b or "") and bool(a)
+
+
+def certificate_sha256(pem_text: str) -> str:
+    """The SHA-256 of the first certificate's DER, lowercase hex: what iya-sts's truststore
+    and stored-certificate removals take."""
+    import hashlib
+    blocks = _pem_blocks(pem_text)
+    if not blocks:
+        return ""
+    return hashlib.sha256(ssl.PEM_cert_to_DER_cert(blocks[0])).hexdigest()
+
+
+def ssf_client_paths(config_path: str) -> dict:
+    """Where the receiver's own key and certificate go: the configuration's ssf.clientKey /
+    ssf.clientCertificate when it names them, else generated/ssf-client.*, beside it."""
+    raw = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    ssf = raw.get("ssf") if isinstance(raw.get("ssf"), dict) else {}
+    base = Path(config_path).resolve().parent
+    out = {}
+    for name, member, default in (("key", "clientKey", SSF_CLIENT_KEY), ("cert", "clientCertificate", SSF_CLIENT_CERT)):
+        value = ssf.get(member) if isinstance(ssf.get(member), str) and ssf.get(member) else default
+        if "-----BEGIN" in value or value.startswith("env:"):
+            raise SystemExit(f"{config_path}'s ssf.{member} must be a file path for this script to write")
+        path = Path(_expand_path(value))
+        out[name] = str(path if path.is_absolute() else (base / path).resolve())
+        out[name + "_value"] = value
+    return out
+
+
+def held_tls_certificates(get, app: str) -> list[dict]:
+    """The TLS client certificates the realm lists for the application (its page's mTLS state)."""
+    page = get("/applications?application=" + urllib.parse.quote(app, safe=""))["body"]
+    found = []
+
+    def walk(value):
+        if isinstance(value, dict):
+            if value.get("serialHex") and value.get("certificatePem"):
+                found.append(value)
+            for inner in value.values():
+                walk(inner)
+        elif isinstance(value, list):
+            for inner in value:
+                walk(inner)
+
+    walk(page)
+    return found
+
+
+def _decrypt_key(encrypted: str, password: str, key_path: str) -> None:
+    """The one-time encrypted PKCS#8 PEM, opened with openssl into key_path (created 0600).
+    The password reaches openssl through its environment, never its command line."""
+    descriptor = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.close(descriptor)
+    env = dict(os.environ, SAML_SSF_CLIENT_KEY_PASSWORD=password)
+    done = subprocess.run(["openssl", "pkey", "-passin", "env:SAML_SSF_CLIENT_KEY_PASSWORD", "-out", key_path],
+                          input=encrypted, capture_output=True, text=True, env=env, check=False)
+    if done.returncode != 0:
+        raise SystemExit(f"the issued key could not be opened: {done.stderr.strip()[:200]}")
+    os.chmod(key_path, 0o600)
+
+
+def write_ssf_client_section(config_path: str, paths: dict) -> None:
+    """ssf.clientKey and ssf.clientCertificate name the receiver's files; the rest of the ssf
+    block and of the file is kept."""
+    path = Path(config_path)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    ssf = raw.get("ssf") if isinstance(raw.get("ssf"), dict) else {}
+    ssf["clientCertificate"] = paths["cert_value"]
+    ssf["clientKey"] = paths["key_value"]
+    raw["ssf"] = ssf
+    path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+
+
+def issue_ssf_client_certificate(api, get, files: DemoFiles, config_path: str, decrypt=_decrypt_key) -> bool:
+    """The receiver's TLS client certificate for /ssf/*, issued by the realm to the application
+    (the realm's tls-client Issuing CA, urn:sts:application:<entityID>, bound to the entry that
+    holds SSF_MANAGE). A certificate on disk that the realm still lists, valid, for the
+    application is kept; otherwise (none yet, or another iya-sts) one is issued. The key is
+    written 0600 and never printed. Answers whether one was issued."""
+    import secrets
+    paths = ssf_client_paths(config_path)
+    on_disk = Path(paths["cert"]).read_text(encoding="utf-8") if Path(paths["cert"]).exists() else ""
+    leaf = (_pem_blocks(on_disk) or [""])[0]
+    if leaf and Path(paths["key"]).exists():
+        for held in held_tls_certificates(get, files.entity_id):
+            if str(held.get("state") or "valid") == "valid" and _same_pem(held.get("certificatePem") or "", leaf):
+                write_ssf_client_section(config_path, paths)
+                print(f"The receiver's TLS client certificate (serial {held.get('serialHex')}) is one the realm issued to "
+                      f"{files.entity_id} and still lists; kept.")
+                return False
+    password = secrets.token_urlsafe(24)
+    answered = api("/applications/issue-tls-client-certificate", {
+        "application": files.entity_id, "password": password, "keyAlg": "ec-p256", "label": SSF_CLIENT_LABEL,
+    })
+    body = answered["body"] if isinstance(answered["body"], dict) else {}
+    if not body.get("ok"):
+        shown = {k: v for k, v in body.items() if k != "files"}
+        raise SystemExit(f"issuing {files.entity_id} a TLS client certificate was refused: {json.dumps(shown)[:400]}")
+    encrypted = ((body.get("files") or {}).get("key") or {}).get("text") or ""
+    issued = body.get("certificate") or {}
+    leaf = issued.get("certificatePem") or ""
+    chain = issued.get("chainPem") or []
+    if not encrypted or not leaf:
+        raise SystemExit("the issued certificate's answer carried no key or certificate")
+    Path(paths["key"]).parent.mkdir(parents=True, exist_ok=True)
+    decrypt(encrypted, password, paths["key"])
+    pems = [leaf] + [pem for pem in (chain if isinstance(chain, list) else [chain]) if pem and not _same_pem(pem, leaf)]
+    Path(paths["cert"]).write_text("".join(pem if pem.endswith("\n") else pem + "\n" for pem in pems), encoding="utf-8")
+    write_ssf_client_section(config_path, paths)
+    print(f"Issued {files.entity_id} a TLS client certificate from the realm's CA (serial {issued.get('serialHex')}, "
+          f"{issued.get('implicitName') or 'urn:sts:application:' + files.entity_id}) for Shared Signals mutual TLS;")
+    print(f"  wrote {paths['key']} (0600) and {paths['cert']}, named in ssf.clientKey / ssf.clientCertificate.")
+    return True
+
+
+def retire_sp_trust(call, files: DemoFiles, config_path: str) -> list[str]:
+    """Once the receiver has its realm-issued certificate: take off iya-sts the trust anchor and
+    the stored copy that earlier runs added for the SP certificate (the current one, and any
+    --new-sp-keys retired). Not held is fine. Answers the fingerprints taken off."""
+    retired_file = Path(config_path).resolve().parent / RETIRED_SP_CERTS
+    prints = [line.strip() for line in (retired_file.read_text(encoding="utf-8").splitlines() if retired_file.exists() else []) if line.strip()]
+    current = certificate_sha256(Path(files.cert).read_text(encoding="utf-8")) if Path(files.cert).exists() else ""
+    if current and current not in prints:
+        prints.insert(0, current)
+    removed, keep = [], []
+    for fingerprint in prints:
+        settled = True
+        for path, body, absent in (("/tls/trust/remove", {"fingerprint": fingerprint}, "holds no anchor"),
+                                   ("/applications/remove-certificate", {"application": files.entity_id, "sha256": fingerprint}, "stores no certificate")):
+            answer = call(path, body)
+            reply = answer["body"] if isinstance(answer["body"], dict) else {}
+            if answer["status"] == 200 and reply.get("ok") is not False:
+                removed.append(f"{path}:{fingerprint}")
+                continue
+            if absent in " ".join(_errors_of(reply)).lower():
+                continue
+            settled = False
+            print(f"  {path} for {fingerprint[:16]}…: refused ({answer['status']}): {' '.join(_errors_of(reply))[:200]}")
+        if not settled and fingerprint != current:
+            keep.append(fingerprint)
+    if retired_file.exists() or keep:
+        retired_file.write_text("".join(f"{line}\n" for line in keep), encoding="utf-8")
+    for item in removed:
+        what, fingerprint = item.split(":", 1)
+        print(f"Removed the SP certificate {fingerprint[:16]}… from iya-sts ({'trust anchor' if 'trust' in what else 'stored on the application'}).")
+    return removed
+
+
+def retire_current_sp_certificate(config_path: str, cert_path: str) -> None:
+    """--new-sp-keys: remember the certificate being replaced, so its anchor is taken off."""
+    if not Path(cert_path).exists():
+        return
+    fingerprint = certificate_sha256(Path(cert_path).read_text(encoding="utf-8"))
+    if not fingerprint:
+        return
+    retired_file = Path(config_path).resolve().parent / RETIRED_SP_CERTS
+    retired_file.parent.mkdir(parents=True, exist_ok=True)
+    lines = retired_file.read_text(encoding="utf-8").splitlines() if retired_file.exists() else []
+    if fingerprint not in lines:
+        lines.append(fingerprint)
+    retired_file.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
 
 
 def container_port(cwd: str | None = None) -> str | None:
@@ -542,9 +756,13 @@ def main(argv: list[str] | None = None) -> None:
             for line in pep_plan(files, base, args.pep_name, args.pep):
                 print(line)
         return
-    if not Path(files.key).exists() and not Path(files.cert).exists():
+    if args.new_sp_keys and (Path(files.key).exists() or Path(files.cert).exists()):
+        retire_current_sp_certificate(args.config, files.cert)
+        print(f"Replacing the SP key pair (--new-sp-keys); the old certificate's fingerprint is kept in {RETIRED_SP_CERTS}.")
+        _generate_keys(args.config, files.entity_id, force=True)
+    elif not Path(files.key).exists() and not Path(files.cert).exists():
         print("No key pair yet; generating one.")
-        _generate_keys(args.config)
+        _generate_keys(args.config, files.entity_id)
     ca = None
     if files.idp_ca:
         try:
@@ -613,8 +831,7 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(f"setting authn.multipleAccounts was refused: {json.dumps(multiple['body'])[:300]}")
     print("authn.multipleAccounts is on: one browser may hold several signed-in people.")
     if files.ssf_transmitter:
-        certificate_pem = Path(files.cert).read_text(encoding="utf-8")
-        for step in ssf_calls(files, base, certificate_pem):
+        for step in ssf_calls(files, base):
             path = step["path"][len(f"{base}/admin-api"):]
             reply = api(path, step["body"])
             errors = " ".join(_errors_of(reply["body"]))
@@ -622,7 +839,12 @@ def main(argv: list[str] | None = None) -> None:
                 raise SystemExit(f"{step['why']}: refused: {json.dumps(reply['body'])[:400]}")
             if not reply["body"].get("ok"):
                 print(f"  {step['why']}: already so ({errors[:160]})")
-        print(f"Shared Signals: {files.entity_id} holds SSF_MANAGE and authenticates to /ssf/* with its own certificate (mutual TLS).")
+        def get_page(path: str) -> dict:
+            return _json(f"{base}/admin-api{path}", ca, "GET", {"accept": "application/json", "authorization": f"Bearer {token}"})
+        issue_ssf_client_certificate(api, get_page, files, args.config)
+        retire_sp_trust(call, files, args.config)
+        print(f"Shared Signals: {files.entity_id} holds SSF_MANAGE and authenticates to /ssf/* by mutual TLS with the "
+              "TLS client certificate the realm issued it (ssf.clientCertificate), not the SAML key pair.")
     url = idp_metadata_url(base, files.entity_id)
     status, data = _request(url, "GET", {"accept": "application/samlmetadata+xml"}, None, ca)
     if status != 200:
@@ -818,8 +1040,13 @@ def setup_pep(api, get, files: DemoFiles, config_path: str, name: str, mode: str
     print(f"Wrote a {mode} pep section into {config_path}.")
 
 
-def _generate_keys(config_path: str) -> None:
-    print(_cli(["generate-keys", "--config", config_path]), end="")
+def _generate_keys(config_path: str, entity_id: str = "", force: bool = False) -> None:
+    args = ["generate-keys", "--config", config_path, "--cn", SP_CERT_CN]
+    if entity_id:
+        args += ["--entity-id", entity_id]
+    if force:
+        args.append("--force")
+    print(_cli(args), end="")
 
 
 if __name__ == "__main__":

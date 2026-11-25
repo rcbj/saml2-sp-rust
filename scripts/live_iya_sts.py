@@ -958,7 +958,9 @@ def main():
             raise RuntimeError("the demo image does not carry the chain the registrar wrote")
         chain_count = baked.stdout.count("BEGIN CERTIFICATE")
         print(f"the demo image carries the {chain_count}-certificate chain at /app/demo/generated/idp-ca.pem", flush=True)
-        mounts = [(demo_dir / "generated" / name, f"/app/demo/generated/{name}") for name in ("sp.key", "sp.crt", "idp-metadata.xml")]
+        # The receiver's realm-issued TLS client certificate (the install script's, with signals on).
+        mounts = [(demo_dir / "generated" / name, f"/app/demo/generated/{name}") for name in ("sp.key", "sp.crt", "idp-metadata.xml", "ssf-client.key", "ssf-client.crt")
+                  if name not in ("ssf-client.key", "ssf-client.crt") or (demo_dir / "generated" / name).exists()]
         if pep:
             mounts.append((pep_key, "/app/demo/" + PEP_KEY))
         start_demo(image, demo_name, demo_port, demo_origin, mounts)
