@@ -163,10 +163,12 @@ let sp = ServiceProvider::from_file("saml.json", None, None)?; // registers the 
 
 // After the assertion validated into `login` and you tracked the session:
 let access = Access::new("read", "order", order_id);
-match sp.decide_session(&receiver.session_index(), &local_id, &login, &access) {
+let decision = sp.decide_session(&receiver.session_index(), &local_id, &login, &access);
+let status = decision.http_status(); // 200 for a Permit, 403 for anything else
+match decision {
     Decision::Permit { obligations, .. } => serve(obligations),
-    Decision::Deny { why } => forbidden(&why),          // 403
-    Decision::Unavailable { why } => forbidden(&why),   // 403: fail closed
+    Decision::Deny { why } => forbidden(status, &why),          // 403
+    Decision::Unavailable { why } => forbidden(status, &why),   // 403: fail closed
 }
 // Without a receiver: sp.decide(&login, &access)
 ```

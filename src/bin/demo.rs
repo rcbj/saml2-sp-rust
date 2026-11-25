@@ -360,13 +360,16 @@ fn order(app: &App, req: &Request, id: &str) -> Response {
         Err(error) => return page_for("Forbidden", &not_configured(&error), 403, Some(&held.login)),
     };
     let action = if req.method == "GET" { "read" } else { "write" };
-    let (status, title, body) = match sp.decide(&held.login, &Access::new(action, "order", id)) {
+    let decision = sp.decide(&held.login, &Access::new(action, "order", id));
+    // 200 for a Permit, 403 for anything else (iya-pep's http_status()).
+    let status = decision.http_status();
+    let (title, body) = match decision {
         Decision::Permit { obligations, .. } => {
             let note = if obligations.is_empty() { String::new() } else { format!("<p><small>{} obligation(s) to discharge.</small></p>", obligations.len()) };
-            (200, "Order", format!("<h1>Order {}</h1><p>The PEP permitted <code>{action}</code>.</p>{note}", escape(id)))
+            ("Order", format!("<h1>Order {}</h1><p>The PEP permitted <code>{action}</code>.</p>{note}", escape(id)))
         }
-        Decision::Deny { why } => (403, "Forbidden", format!("<h1>Not allowed</h1><p>The PEP denied <code>{action}</code> on order {}: {}</p>", escape(id), escape(&why))),
-        Decision::Unavailable { why } => (403, "Forbidden", format!("<h1>No decision</h1><p>The PEP could not decide: {}</p>", escape(&why))),
+        Decision::Deny { why } => ("Forbidden", format!("<h1>Not allowed</h1><p>The PEP denied <code>{action}</code> on order {}: {}</p>", escape(id), escape(&why))),
+        Decision::Unavailable { why } => ("Forbidden", format!("<h1>No decision</h1><p>The PEP could not decide: {}</p>", escape(&why))),
     };
     page_for(title, &body, status, Some(&held.login))
 }
@@ -395,10 +398,13 @@ fn attribute_protected(app: &App, req: &Request) -> Response {
         Err(error) => return page_for("Forbidden", &not_configured(&error), 403, Some(&held.login)),
     };
     let what = "<p><small>The demo application's policy permits <code>read</code> on <code>attribute-protected</code> when your directory attribute <code>attr1</code> is <code>abc123</code>. The PEP asked iya-sts's PIP for it: it is not in your SAML assertion.</small></p>";
-    let (status, title, body) = match sp.decide(&held.login, &Access::new("read", "attribute-protected", "attr1")) {
-        Decision::Permit { .. } => (200, "Attribute-protected", format!("<h1>Allowed</h1><p class=\"notice\">The PEP permitted it: your <code>attr1</code> is <code>abc123</code>.</p>{what}")),
-        Decision::Deny { why } => (403, "Forbidden", format!("<h1>Not allowed</h1><p class=\"problem\">The PEP denied it: {}</p>{what}", escape(&why))),
-        Decision::Unavailable { why } => (403, "Forbidden", format!("<h1>No decision</h1><p class=\"problem\">The PEP could not decide: {}</p>{what}", escape(&why))),
+    let decision = sp.decide(&held.login, &Access::new("read", "attribute-protected", "attr1"));
+    // 200 for a Permit, 403 for anything else (iya-pep's http_status()).
+    let status = decision.http_status();
+    let (title, body) = match decision {
+        Decision::Permit { .. } => ("Attribute-protected", format!("<h1>Allowed</h1><p class=\"notice\">The PEP permitted it: your <code>attr1</code> is <code>abc123</code>.</p>{what}")),
+        Decision::Deny { why } => ("Forbidden", format!("<h1>Not allowed</h1><p class=\"problem\">The PEP denied it: {}</p>{what}", escape(&why))),
+        Decision::Unavailable { why } => ("Forbidden", format!("<h1>No decision</h1><p class=\"problem\">The PEP could not decide: {}</p>{what}", escape(&why))),
     };
     page_for(title, &body, status, Some(&held.login))
 }
