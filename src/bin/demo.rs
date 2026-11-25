@@ -54,6 +54,9 @@ struct App {
     sessions: Arc<Mutex<HashMap<String, Held>>>,
     events: Arc<Mutex<Vec<LiveEvent>>>,
     event_seq: Arc<std::sync::atomic::AtomicU64>,
+    /// The service provider, built from `config_path` on first use (once
+    /// per process: main makes one App). A test sets it beforehand.
+    sp: OnceLock<Result<ServiceProvider, String>>,
 }
 
 fn main() {
@@ -162,6 +165,7 @@ fn configure() -> Result<App, String> {
         port, public_url, public_given, config_path, secret, secure_cookies, ssf_transmitter, ssf_poll_ms,
         receiver: Arc::new(Mutex::new(None)), receiver_state: Arc::new(Mutex::new(receiver_state)), sessions: Arc::new(Mutex::new(HashMap::new())),
         events: Arc::new(Mutex::new(Vec::new())), event_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        sp: OnceLock::new(),
     })
 }
 
@@ -216,9 +220,8 @@ fn secure_from(acs: &str, port: u16) -> bool {
     scheme == "https" || hostname(&host) == "localhost" || hostname(&host) == "127.0.0.1"
 }
 
-fn provider(app: &App) -> Result<&'static ServiceProvider, String> {
-    static SP: OnceLock<Result<ServiceProvider, String>> = OnceLock::new();
-    SP.get_or_init(|| {
+fn provider(app: &App) -> Result<&ServiceProvider, String> {
+    app.sp.get_or_init(|| {
         let file = read_file(&app.config_path);
         let (entity, acs) = endpoints_of(&file, app.port, app.public_given, &app.public_url);
         let mut overrides = Map::new();
@@ -1244,7 +1247,7 @@ mod tests {
             port: 0, public_url: String::new(), public_given: false, config_path: "/nonexistent/saml.json".into(), secret: vec![7; 32],
             secure_cookies: false, ssf_transmitter: String::new(), ssf_poll_ms: 0, receiver: Arc::new(Mutex::new(None)),
             receiver_state: Arc::new(Mutex::new(String::new())), sessions: Arc::new(Mutex::new(HashMap::new())), events: Arc::new(Mutex::new(Vec::new())),
-            event_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            event_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)), sp: OnceLock::new(),
         }
     }
 
@@ -1484,5 +1487,251 @@ mod tests {
             assert_eq!(code.last().copied(), Some("})();"), "{name} closes it");
         }
         assert!(include_str!("../../demo/public/styles.css").contains("[hidden] { display: none !important; }"), "hidden hides a button too");
+    }
+
+    /// The demo's two PEP-protected pages through `route()`, decided by a
+    /// `local` PEP holding the demo application's own policy: the XACML
+    /// iya-sts stores for the install script's `orders_policy()` ALFA
+    /// (`src/authzen/demo-orders.xml`; the live `--pep` run checks it is
+    /// what iya-sts stored). The stub PDP below is iya-sts's side for one
+    /// realm: the PEP's token, registration and heartbeat, the catalogue
+    /// (the install script's one row, `subject.acr` -> `urn:example:acr`),
+    /// the bound-application pull, and the PIP, which answers `attr1` per
+    /// person from its own directory: the assertion never carries it.
+    #[cfg(feature = "local")]
+    mod protected_pages {
+        use super::*;
+        use saml2_sp::pep::Access;
+
+        const ORDERS_XML: &str = include_str!("../authzen/demo-orders.xml");
+        const ATTR1: &str = "urn:sts:xacml:attribute:attr1";
+
+        /// The PIP's directory: attr1 per username (none for carol).
+        fn attr1_of(user: &str) -> Option<&'static str> {
+            match user {
+                "alice" => Some("abc123"),
+                "bob" => Some("not-abc123"),
+                _ => None,
+            }
+        }
+
+        struct Stub {
+            url: String,
+            /// Each PIP query: the subject and the attribute ids asked for.
+            pip: Arc<Mutex<Vec<(String, Vec<String>)>>>,
+        }
+
+        fn answer(req: &Request, policies_up: bool, pip: &Mutex<Vec<(String, Vec<String>)>>) -> Response {
+            let path = req.path.trim_start_matches("/realm/demo");
+            let write = |status: u16, value: Value| text(status, "application/json", &value.to_string());
+            if path != "/oauth2/token" && !req.headers.get("authorization").is_some_and(|a| a.starts_with("DPoP ")) {
+                return write(401, json!({"error": "invalid_token"}));
+            }
+            match path {
+                "/oauth2/token" => write(200, json!({"access_token": "demo-pep-token", "token_type": "DPoP", "expires_in": 300})),
+                "/xacml/pep/register" => write(201, json!({"registered": true, "identity": "uid=pep-saml-demo,ou=users,dc=demo"})),
+                "/xacml/pep/heartbeat" => write(200, json!({"acknowledged": true, "current": true})),
+                "/xacml/pep/authzen-catalogue" => write(200, json!({"syncToken": "c1", "realm": "demo",
+                    "rows": [{"object": "subject", "property": "acr", "attributeId": "urn:example:acr"}],
+                    "fgaApplications": ["http://127.0.0.1:9/saml/metadata"], "settings": {"obligationsProfile": false}})),
+                "/xacml/pep/policies" if policies_up => write(200, json!({"syncToken": "p1", "scope": "bound-application", "source": "application",
+                    "policies": [{"name": "saml2-sp demo", "policyId": "urn:saml-sp-demo:samlspdemo:orders", "kind": "Policy", "version": "1.0",
+                        "isRoot": true, "description": "", "document": ORDERS_XML}], "withheld": [], "note": ""})),
+                "/xacml/pep/policies" => write(503, json!({"error": "server_error", "error_description": "not now"})),
+                "/xacml/pip" => {
+                    let subject = regex::Regex::new(r#"subject-id"[^>]*>\s*<AttributeValue[^>]*>([^<]*)<"#).unwrap();
+                    let designator = regex::Regex::new(r#"<AttributeDesignator[^>]*Category="([^"]*)"[^>]*AttributeId="([^"]*)"[^>]*DataType="([^"]*)""#).unwrap();
+                    let user = subject.captures(&req.body).map(|c| c[1].to_string()).unwrap_or_default();
+                    let asked: Vec<_> = designator.captures_iter(&req.body).map(|c| (c[1].to_string(), c[2].to_string(), c[3].to_string())).collect();
+                    pip.lock().unwrap().push((user.clone(), asked.iter().map(|a| a.1.clone()).collect()));
+                    let mut out = String::from("<PIPResponse xmlns=\"urn:sts:xacml:pip:1.0\">");
+                    for (category, id, data_type) in &asked {
+                        if let (true, Some(value)) = (id == ATTR1, attr1_of(&user)) {
+                            out.push_str(&format!("<Attributes xmlns=\"urn:oasis:names:tc:xacml:3.0:core:schema:wd-17\" Category=\"{category}\"><Attribute AttributeId=\"{id}\" IncludeInResult=\"false\"><AttributeValue DataType=\"{data_type}\">{value}</AttributeValue></Attribute></Attributes>"));
+                        }
+                    }
+                    out.push_str("</PIPResponse>");
+                    text(200, "application/xml", &out)
+                }
+                "/admin-api/pep-audit" => write(200, json!({"acknowledged": 0})),
+                _ => write(404, json!({"error": "not_found"})),
+            }
+        }
+
+        fn stub(policies_up: bool) -> Stub {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://127.0.0.1:{}/realm/demo", listener.local_addr().unwrap().port());
+            let pip = Arc::new(Mutex::new(Vec::new()));
+            let log = pip.clone();
+            std::thread::spawn(move || {
+                for conn in listener.incoming() {
+                    let Ok(mut stream) = conn else { continue };
+                    let log = log.clone();
+                    std::thread::spawn(move || {
+                        if let Some(req) = read_request(&mut stream) {
+                            let _ = write_response(&mut stream, &answer(&req, policies_up, &log));
+                        }
+                    });
+                }
+            });
+            Stub { url, pip }
+        }
+
+        /// The demo with a `local` PEP on the stub, as the install script's
+        /// `--pep local` configures it (the PEP's own key, `application` = entityId).
+        fn demo(policies_up: bool) -> (App, Stub) {
+            let stub = stub(policies_up);
+            let key = std::env::temp_dir().join(format!("saml-demo-pages-{}-{}.pem", std::process::id(), b64url(&random(9))));
+            std::fs::write(&key, rcgen::KeyPair::generate().unwrap().serialize_pem()).unwrap();
+            let sp = sp_with(Some(json!({"name": "pep-saml-demo", "mode": "local", "assertionKey": key.to_string_lossy(), "pdpUrl": stub.url,
+                "heartbeatIntervalMs": 60000, "pollIntervalMs": 60000, "decisionRecords": false})));
+            let _ = std::fs::remove_file(&key);
+            if policies_up {
+                let pep = sp.pep().expect("a pep section makes a PEP");
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                while !pep.status().holds_policy {
+                    assert!(std::time::Instant::now() < deadline, "the local PEP never held the demo's policy: {}", pep.status().last_error);
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            let app = app();
+            assert!(app.sp.set(Ok(sp)).is_ok());
+            (app, stub)
+        }
+
+        /// A sign-in as iya-sts writes one, for `user`, with or without an
+        /// AuthnContextClassRef. attr1 is never in it.
+        fn person(user: &str, with_acr: bool) -> SamlLogin {
+            let mut login = alice();
+            for values in login.attributes.values_mut() {
+                *values = values.iter().map(|v| v.replace("alice", user)).collect();
+            }
+            if !with_acr {
+                login.authn_context_class_ref.clear();
+            }
+            assert!(!login.attributes.keys().any(|k| k.contains("attr1")));
+            login
+        }
+
+        /// A browser holding a session for `login`.
+        fn signed_in(app: &App, login: &SamlLogin) -> String {
+            let sid = b64url(&random(16));
+            app.sessions.lock().unwrap().insert(sid.clone(), Held { login: login.clone(), expires_ms: now_ms() + 3_600_000 });
+            sid
+        }
+
+        fn request(method: &str, path: &str, sid: Option<&str>) -> Request {
+            let mut req = get(path);
+            req.method = method.into();
+            if let Some(sid) = sid {
+                req.headers.insert("cookie".into(), format!("sid={sid}"));
+            }
+            req
+        }
+
+        /// One request through the demo's router; the status must be what
+        /// the PEP's decision maps to (`http_status()`) and `want`.
+        fn check(app: &App, method: &str, path: &str, login: &SamlLogin, access: Access, want: u16) -> String {
+            let sid = signed_in(app, login);
+            let answer = route(app, &request(method, path, Some(&sid)));
+            let body = String::from_utf8(answer.body).unwrap();
+            let decided = provider(app).unwrap().decide(login, &access).http_status();
+            assert_eq!(answer.status, decided, "{method} {path}: the page's status is the decision's http_status()");
+            assert_eq!(answer.status, want, "{method} {path} for {}: {body}", display_name(login));
+            assert!(body.contains("class=\"site-nav\"") && body.contains("acct-menu"), "a signed-in page, with the top bar");
+            body
+        }
+
+        fn read_order() -> Access { Access::new("read", "order", "42") }
+        fn write_order() -> Access { Access::new("write", "order", "42") }
+        fn read_attribute() -> Access { Access::new("read", "attribute-protected", "attr1") }
+
+        #[test]
+        fn an_allowed_user_reads_both_protected_pages() {
+            let (app, stub) = demo(true);
+            let alice = person("alice", true);
+            let page = check(&app, "GET", "/attribute-protected", &alice, read_attribute(), 200);
+            assert!(page.contains("<title>Attribute-protected</title>") && page.contains("<h1>Allowed</h1>") && page.contains("The PEP permitted it: your <code>attr1</code> is <code>abc123</code>."), "{page}");
+            let order = check(&app, "GET", "/orders/42", &alice, read_order(), 200);
+            assert!(order.contains("<h1>Order 42</h1>") && order.contains("The PEP permitted <code>read</code>."), "{order}");
+            let asked = stub.pip.lock().unwrap().clone();
+            assert!(asked.iter().any(|(user, ids)| user == "alice" && ids.iter().any(|id| id == ATTR1)), "attr1 came from the PIP, for alice: {asked:?}");
+        }
+
+        #[test]
+        fn a_denied_user_is_403_on_attribute_protected_whatever_else_attr1_is_or_without_it() {
+            let (app, _stub) = demo(true);
+            for user in ["bob", "carol"] {
+                let login = person(user, true);
+                let page = check(&app, "GET", "/attribute-protected", &login, read_attribute(), 403);
+                assert!(page.contains("<title>Forbidden</title>") && page.contains("<h1>Not allowed</h1>") && page.contains("The PEP denied it"), "{user}: {page}");
+                assert!(!page.contains("<h1>Allowed</h1>"));
+                // attr1 has nothing to do with orders: reading one is still allowed.
+                let order = check(&app, "GET", "/orders/42", &login, read_order(), 200);
+                assert!(order.contains("<h1>Order 42</h1>"), "{user}: {order}");
+            }
+        }
+
+        #[test]
+        fn writing_an_order_is_403_even_for_the_allowed_user() {
+            let (app, _stub) = demo(true);
+            let alice = person("alice", true);
+            let page = check(&app, "POST", "/orders/42", &alice, write_order(), 403);
+            assert!(page.contains("<title>Forbidden</title>") && page.contains("The PEP denied <code>write</code> on order 42"), "{page}");
+            // Any method but GET is write.
+            check(&app, "DELETE", "/orders/42", &alice, write_order(), 403);
+        }
+
+        #[test]
+        fn a_sign_in_without_an_authn_context_class_ref_cannot_read_an_order() {
+            let (app, _stub) = demo(true);
+            let alice = person("alice", false);
+            let order = check(&app, "GET", "/orders/42", &alice, read_order(), 403);
+            assert!(order.contains("The PEP denied <code>read</code> on order 42"), "{order}");
+            // attr1 is still abc123, and that page does not need the claim.
+            check(&app, "GET", "/attribute-protected", &alice, read_attribute(), 200);
+        }
+
+        #[test]
+        fn signed_out_is_401_on_both_protected_pages() {
+            let (app, _stub) = demo(true);
+            for (method, path) in [("GET", "/attribute-protected"), ("GET", "/orders/42"), ("POST", "/orders/42")] {
+                for sid in [None, Some("no-such-session")] {
+                    let answer = route(&app, &request(method, path, sid));
+                    let body = String::from_utf8(answer.body).unwrap();
+                    assert_eq!(answer.status, 401, "{method} {path} without a sign-in: {body}");
+                    assert!(body.contains("<h1>Sign in first</h1>") && body.contains("href=\"/login\""), "{body}");
+                    assert!(!body.contains("acct-menu"), "no one to name");
+                }
+            }
+            // Signing out ends it: the same browser is 401 again.
+            let sid = signed_in(&app, &person("alice", true));
+            assert_eq!(route(&app, &request("GET", "/attribute-protected", Some(&sid))).status, 200);
+            assert_eq!(route(&app, &request("POST", "/logout", Some(&sid))).status, 303);
+            assert_eq!(route(&app, &request("GET", "/attribute-protected", Some(&sid))).status, 401);
+            assert_eq!(route(&app, &request("GET", "/orders/42", Some(&sid))).status, 401);
+        }
+
+        #[test]
+        fn a_pep_that_cannot_decide_is_403_on_both_pages() {
+            // The pull fails, so the local PEP holds no policy: Unavailable.
+            let (app, _stub) = demo(false);
+            let alice = person("alice", true);
+            for (path, access) in [("/attribute-protected", read_attribute()), ("/orders/42", read_order())] {
+                let page = check(&app, "GET", path, &alice, access, 403);
+                assert!(page.contains("<h1>No decision</h1>") && page.contains("The PEP could not decide"), "{path}: {page}");
+            }
+        }
+
+        #[test]
+        fn the_policy_document_is_the_install_scripts_policy() {
+            let script = include_str!("../../scripts/configure_iya_sts.py");
+            for (constant, value) in [("ACR_ATTRIBUTE", "urn:example:acr"), ("TEST_ATTRIBUTE_VALUE", "abc123"), ("ATTRIBUTE_PROTECTED", "attribute-protected")] {
+                assert!(script.contains(&format!("{constant} = \"{value}\"")), "{constant} is still {value} in the install script");
+                assert!(ORDERS_XML.contains(&format!(">{value}<")) || ORDERS_XML.contains(&format!("\"{value}\"")), "{value} is in the policy document");
+            }
+            assert!(script.contains("OWN_POLICY_IDS = (\"urn:saml-sp-demo:samlspdemo:orders\",)") && ORDERS_XML.contains("PolicyId=\"urn:saml-sp-demo:samlspdemo:orders\""));
+            assert!(ORDERS_XML.contains(ATTR1) && ORDERS_XML.contains("string-bag-size"));
+        }
     }
 }
