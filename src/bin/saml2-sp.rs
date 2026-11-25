@@ -133,6 +133,10 @@ fn write_metadata(args: &BTreeMap<String, String>) -> Result<(), String> {
     if config_path.is_empty() { return Err(format!("metadata needs --config\n\n{USAGE}")); }
     let mut raw = read_object(config_path)?;
     raw.remove("idpCa");
+    // The metadata carries the SAML key pair only; the receiver's own TLS client
+    // identity (ssf.clientCertificate / ssf.clientKey) is not needed, and may not
+    // exist yet (the install script writes the metadata before the realm issues it).
+    raw.remove("ssf");
     if let Some(entity) = args.get("entity-id").filter(|v| !v.is_empty()) { raw.insert("entityId".into(), Value::String(entity.clone())); }
     if let Some(acs) = args.get("acs-url").filter(|v| !v.is_empty()) { raw.insert("acsUrl".into(), Value::String(acs.clone())); }
     let base = abs_path(config_path).parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
@@ -196,4 +200,37 @@ fn write_mode(path: &str, text: &str, mode: u32) -> Result<(), String> {
     }
     let _ = mode;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The install script writes the SP metadata before the realm issues the
+    /// receiver its TLS client certificate, so a configuration naming
+    /// `ssf.clientCertificate` files that do not exist yet still has metadata;
+    /// and a generated key pair is named for the demo, with its entityID.
+    #[test]
+    fn metadata_needs_no_ssf_client_files_and_keys_are_named() {
+        let dir = std::env::temp_dir().join(format!("saml2-sp-cli-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("generated")).unwrap();
+        let config = dir.join("saml.json");
+        std::fs::write(&config, r#"{"entityId": "http://localhost:3047/saml/metadata", "acsUrl": "http://localhost:3047/saml/acs",
+            "privateKey": "file:generated/sp.key", "certificate": "file:generated/sp.crt", "idpMetadata": "file:generated/idp-metadata.xml",
+            "ssf": {"transmitter": "https://localhost:8081", "clientCertificate": "generated/ssf-client.crt", "clientKey": "generated/ssf-client.key"}}"#).unwrap();
+        let config = config.to_string_lossy().to_string();
+        let args = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<_, _>>();
+        generate_keys(&args(&[("config", &config), ("cn", "saml2-sp-rust demo SP"), ("bits", "2048")])).unwrap();
+        let pem = std::fs::read_to_string(dir.join("generated/sp.crt")).unwrap();
+        let der = pem.lines().filter(|l| !l.starts_with("-----")).collect::<String>();
+        let der = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, der).unwrap();
+        let (_, cert) = x509_parser::parse_x509_certificate(&der).unwrap();
+        assert_eq!(cert.subject().to_string(), "CN=saml2-sp-rust demo SP, O=saml2-sp");
+        assert!(format!("{:?}", cert.subject_alternative_name().unwrap().unwrap().value).contains("http://localhost:3047/saml/metadata"));
+        let out = dir.join("generated/sp-metadata.xml").to_string_lossy().to_string();
+        write_metadata(&args(&[("config", &config), ("out", &out)])).unwrap();
+        assert!(std::fs::read_to_string(&out).unwrap().contains("entityID=\"http://localhost:3047/saml/metadata\""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
