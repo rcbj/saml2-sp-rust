@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
-use saml2_sp::{AcsBody, LoginOptions, ReceiverOptions, SamlLogin, ServiceProvider, SignalsReceiver, TlsOptions};
+use saml2_sp::{AcsBody, LoginOptions, ReceiverOptions, SamlLogin, ServiceProvider, SignalEvent, SignalsReceiver, TlsOptions};
 use serde_json::{json, Map, Value};
 use sha2::Sha256;
 
@@ -20,7 +20,23 @@ const SESSION_MS: i64 = 8 * 60 * 60 * 1000;
 
 struct Held { login: SamlLogin, expires_ms: i64 }
 
-struct Seen { event_type: String, jti: String }
+/// One received Shared Signals event, as the CAEP & RISC events tab draws
+/// it and `app.js` receives it from `/api/signals`.
+#[derive(Clone)]
+struct LiveEvent {
+    id: u64,
+    event_type: String,
+    jti: String,
+    /// CAEP, RISC, SSF (the stream's own) or STS (iya-sts's own).
+    family: String,
+    at: String,
+    subject: String,
+    members: Value,
+    ended: bool,
+}
+
+/// The most events kept; the oldest go first.
+const MAX_EVENTS: usize = 200;
 
 const SESSION_REVOKED: &str = "https://schemas.openid.net/secevent/caep/event-type/session-revoked";
 
@@ -36,7 +52,8 @@ struct App {
     receiver: Arc<Mutex<Option<SignalsReceiver>>>,
     receiver_state: Arc<Mutex<String>>,
     sessions: Arc<Mutex<HashMap<String, Held>>>,
-    events: Arc<Mutex<Vec<Seen>>>,
+    events: Arc<Mutex<Vec<LiveEvent>>>,
+    event_seq: Arc<std::sync::atomic::AtomicU64>,
 }
 
 fn main() {
@@ -144,7 +161,7 @@ fn configure() -> Result<App, String> {
     Ok(App {
         port, public_url, public_given, config_path, secret, secure_cookies, ssf_transmitter, ssf_poll_ms,
         receiver: Arc::new(Mutex::new(None)), receiver_state: Arc::new(Mutex::new(receiver_state)), sessions: Arc::new(Mutex::new(HashMap::new())),
-        events: Arc::new(Mutex::new(Vec::new())),
+        events: Arc::new(Mutex::new(Vec::new())), event_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     })
 }
 
@@ -244,10 +261,11 @@ fn start_receiver(app: &App, sp: &ServiceProvider) {
         Err(error) => { *app.receiver_state.lock().expect("state") = format!("not running: {error}"); return; }
     };
     let events = app.events.clone();
+    let seq = app.event_seq.clone();
     let sessions = app.sessions.clone();
     let for_untrack = built.clone();
     built.on("*", move |signal| {
-        events.lock().expect("events").push(Seen { event_type: signal.event_type.clone(), jti: signal.jti.clone() });
+        remember_live_event(&events, &seq, signal);
         // The assertion SessionIndex often is the IdP session, and on_end_sessions already dropped it.
         // When it is only the assertion id, this demo still has that one login.
         if signal.event_type == SESSION_REVOKED {
@@ -297,6 +315,13 @@ fn route(app: &App, req: &Request) -> Response {
         "/styles.css" => return file_response("demo/public/styles.css", "text/css"),
         "/pep.js" => return file_response("demo/public/pep.js", "text/javascript"),
         "/app.js" => return file_response("demo/public/app.js", "text/javascript"),
+        "/panes.js" => return file_response("demo/public/panes.js", "text/javascript"),
+        "/menu.js" => return file_response("demo/public/menu.js", "text/javascript"),
+        "/api/signals" if req.method == "GET" => return signals_api(app, req),
+        // No Server-Sent Events here: 204 tells app.js's EventSource to give
+        // up, and it polls /api/signals every 3 s instead.
+        "/events" if req.method == "GET" => return text(204, "text/plain", ""),
+        "/signals/verify" if req.method == "POST" => return verify_signals(app, req),
         "/saml/metadata" => {
             let sp = match provider(app) { Ok(sp) => sp, Err(error) => return text(500, "text/plain", &error) };
             return text(200, "application/samlmetadata+xml", &sp.metadata());
@@ -306,6 +331,10 @@ fn route(app: &App, req: &Request) -> Response {
         "/logout" if req.method == "POST" => return logout(app, req),
         "/" if req.method == "GET" => return page(app, req),
         _ => {}
+    }
+    #[cfg(feature = "pep")]
+    if req.path == "/attribute-protected" {
+        return attribute_protected(app, req);
     }
     #[cfg(feature = "pep")]
     if let Some(id) = req.path.strip_prefix("/orders/").filter(|id| !id.is_empty() && !id.contains('/')) {
@@ -328,17 +357,50 @@ fn order(app: &App, req: &Request, id: &str) -> Response {
     };
     let sp = match provider(app) {
         Ok(sp) => sp,
-        Err(error) => return page_html("Forbidden", &format!("<h1>Not allowed</h1><p class=\"problem\">No decision could be asked for: the service provider is not configured: {}</p>", escape(&error)), 403),
+        Err(error) => return page_for("Forbidden", &not_configured(&error), 403, Some(&held.login)),
     };
     let action = if req.method == "GET" { "read" } else { "write" };
-    match sp.decide(&held.login, &Access::new(action, "order", id)) {
+    let (status, title, body) = match sp.decide(&held.login, &Access::new(action, "order", id)) {
         Decision::Permit { obligations, .. } => {
             let note = if obligations.is_empty() { String::new() } else { format!("<p><small>{} obligation(s) to discharge.</small></p>", obligations.len()) };
-            page_html("Order", &format!("<h1>Order {}</h1><p>The PEP permitted <code>{action}</code>.</p>{note}", escape(id)), 200)
+            (200, "Order", format!("<h1>Order {}</h1><p>The PEP permitted <code>{action}</code>.</p>{note}", escape(id)))
         }
-        Decision::Deny { why } => page_html("Forbidden", &format!("<h1>Not allowed</h1><p>The PEP denied <code>{action}</code> on order {}: {}</p>", escape(id), escape(&why)), 403),
-        Decision::Unavailable { why } => page_html("Forbidden", &format!("<h1>No decision</h1><p>The PEP could not decide: {}</p>", escape(&why)), 403),
-    }
+        Decision::Deny { why } => (403, "Forbidden", format!("<h1>Not allowed</h1><p>The PEP denied <code>{action}</code> on order {}: {}</p>", escape(id), escape(&why))),
+        Decision::Unavailable { why } => (403, "Forbidden", format!("<h1>No decision</h1><p>The PEP could not decide: {}</p>", escape(&why))),
+    };
+    page_for(title, &body, status, Some(&held.login))
+}
+
+/// The 403 page when no service provider is there to ask a decision of.
+#[cfg(feature = "pep")]
+fn not_configured(error: &str) -> String {
+    format!("<h1>Not allowed</h1><p class=\"problem\">No decision could be asked for: the service provider is not configured: {}</p>", escape(error))
+}
+
+/// `GET /attribute-protected`: decided by the embedded PEP against the demo
+/// application's own (fine-grained authorization) policy, which permits it
+/// to a person whose directory attribute attr1 is abc123. The value is not
+/// in the assertion: the PEP asks iya-sts's PIP for it (`POST /xacml/pip`),
+/// in `local` mode as in `central`. 401 without a sign-in, 200 on a Permit,
+/// 403 on a Deny and on any other PEP failure (no decision, or no service
+/// provider to ask), the page saying which.
+#[cfg(feature = "pep")]
+fn attribute_protected(app: &App, req: &Request) -> Response {
+    use saml2_sp::pep::{Access, Decision};
+    let Some(held) = current_session(app, req) else {
+        return page_html("Sign in", "<h1>Sign in first</h1><p><a href=\"/login\">Sign in</a></p>", 401);
+    };
+    let sp = match provider(app) {
+        Ok(sp) => sp,
+        Err(error) => return page_for("Forbidden", &not_configured(&error), 403, Some(&held.login)),
+    };
+    let what = "<p><small>The demo application's policy permits <code>read</code> on <code>attribute-protected</code> when your directory attribute <code>attr1</code> is <code>abc123</code>. The PEP asked iya-sts's PIP for it: it is not in your SAML assertion.</small></p>";
+    let (status, title, body) = match sp.decide(&held.login, &Access::new("read", "attribute-protected", "attr1")) {
+        Decision::Permit { .. } => (200, "Attribute-protected", format!("<h1>Allowed</h1><p class=\"notice\">The PEP permitted it: your <code>attr1</code> is <code>abc123</code>.</p>{what}")),
+        Decision::Deny { why } => (403, "Forbidden", format!("<h1>Not allowed</h1><p class=\"problem\">The PEP denied it: {}</p>{what}", escape(&why))),
+        Decision::Unavailable { why } => (403, "Forbidden", format!("<h1>No decision</h1><p class=\"problem\">The PEP could not decide: {}</p>{what}", escape(&why))),
+    };
+    page_for(title, &body, status, Some(&held.login))
 }
 
 fn live_status(app: &App) -> Response {
@@ -350,8 +412,11 @@ fn live_status(app: &App) -> Response {
         for held in sessions.values() {
             if now > held.expires_ms { continue; }
             signed_in = true;
-            if subject.is_none() && !held.login.name_id.is_empty() {
-                subject = Some(held.login.name_id.clone());
+            // The username, as the page names the person; the NameID only
+            // when the assertion carries nothing else.
+            let who = display_name(&held.login);
+            if subject.is_none() && !who.is_empty() {
+                subject = Some(who);
             }
         }
         (signed_in, subject)
@@ -452,10 +517,10 @@ fn human(d: Option<Duration>, ago: bool) -> String {
 fn pep_fragment(sp: Option<&ServiceProvider>) -> String {
     let v = pep_json(sp);
     if v["enabled"] != json!(true) {
-        return format!(
+        return pane("pep-none", "No embedded PEP", "", &format!(
             "<p class=\"notice\">No embedded PEP: {}. Add a <code>pep</code> section to the configuration (<code>scripts/configure_iya_sts.py --pep local</code> writes one) and build with the <code>local</code> (or <code>pep</code>) feature; see <code>docs/remote-pep.md</code>.</p>",
             escape(v["why"].as_str().unwrap_or(""))
-        );
+        ));
     }
     let text = |x: &Value| match x {
         Value::String(s) if s.is_empty() => "—".to_string(),
@@ -514,7 +579,7 @@ fn pep_fragment(sp: Option<&ServiceProvider>) -> String {
     let mut out = String::new();
     let problems = v["problems"].as_str().unwrap_or("");
     if !problems.is_empty() {
-        out.push_str(&format!("<p class=\"problem\">{}</p>", escape(problems)));
+        out.push_str(&pane("pep-problems", "Problems", "", &format!("<p class=\"problem\">{}</p>", escape(problems))));
     }
     for (title, rows) in [("Decisions", decisions), ("Cached policy", policy), ("The PEP", the_pep), ("Control plane", control)] {
         // Collapsible; the stable id lets pep.js keep a pane the person closed closed.
@@ -525,6 +590,10 @@ fn pep_fragment(sp: Option<&ServiceProvider>) -> String {
         }
         out.push_str("</table></details>");
     }
+    out.push_str(&pane("pep-try", "Try it", "", "<ul class=\"checks\">\
+<li><a href=\"/orders/42\">/orders/42</a> <span class=\"muted\">read an order: permitted when your sign-in carried an AuthnContextClassRef</span></li>\
+<li><a href=\"/attribute-protected\">/attribute-protected</a> <span class=\"muted\">permitted when your directory attribute attr1 is abc123, which the PEP asks iya-sts's PIP for</span></li>\
+</ul><p><small>Each is decided by this PEP against the demo application's own policy; the counters above move as you try them.</small></p>"));
     out.push_str("<p><small>Refreshed every 2 seconds. <a href=\"/pep-status\">As JSON</a>.</small></p>");
     out
 }
@@ -534,38 +603,407 @@ fn page(app: &App, req: &Request) -> Response {
     if let Err(error) = provider(app) {
         problem = format!("The service provider is not configured yet: {error}. Run the setup script (python scripts/configure_iya_sts.py).");
     }
-    let current = current_session(app, req);
-    let mut body = "<h1>SAML service provider</h1>".to_string();
-    if !problem.is_empty() && current.is_none() { body.push_str(&format!("<p class=\"problem\">{}</p>", escape(&problem))); }
     let state = app.receiver_state.lock().expect("state").clone();
-    if let Some(current) = current {
-        // Two tabs: Session (what this page always showed) and Policy enforcement.
-        let tab = if query_value(&req.query, "tab") == "pep" { "pep" } else { "session" };
-        let content = if tab == "pep" {
-            format!("<div id=\"pep-panel\">{}</div><script src=\"/pep.js\" defer></script>", pep_fragment(provider(app).ok()))
-        } else {
-            let mut session = format!("<p>Shared Signals: {}</p>", escape(&state));
-            session.push_str(&format!("<p>Signed in as <strong>{}</strong> ({}).</p>", escape(&current.login.name_id), escape(&current.login.binding)));
-            session
+    if let Some(current) = current_session(app, req) {
+        let sid = cookie_value(req, "sid");
+        // Three tabs: Session, CAEP & RISC events, and Policy enforcement.
+        let tab = match query_value(&req.query, "tab").as_str() {
+            "pep" => "pep",
+            "events" => "events",
+            _ => "session",
+        };
+        let events = app.events.lock().expect("events").clone();
+        let last_id = events.last().map(|e| e.id).unwrap_or(0);
+        // Every tab's blocks are collapsible panes; one toggle opens or
+        // closes all of a tab's panes (panes.js shows it).
+        let toggle = "<p class=\"pane-tools\"><button type=\"button\" class=\"secondary small\" id=\"panes-toggle\" hidden>Collapse all</button></p>";
+        let content = match tab {
+            "pep" => format!("{toggle}<div id=\"pep-panel\" aria-live=\"polite\">{}</div><script src=\"/pep.js\" defer></script>", pep_fragment(provider(app).ok())),
+            "events" => {
+                let notice = match query_value(&req.query, "verify").as_str() {
+                    "sent" => "A verification event was requested; it appears below when the transmitter sends it.",
+                    "refused" => "The transmitter refused the verification request.",
+                    _ => "",
+                };
+                format!("{toggle}{}", events_panel(&events, &state, notice))
+            }
+            _ => {
+                let session = match provider(app) {
+                    Ok(sp) => {
+                        let (held, tracked) = {
+                            let sessions = app.sessions.lock().expect("sessions");
+                            let receiver = app.receiver.lock().expect("receiver");
+                            (sessions.len(), receiver.as_ref().map(|r| r.session_index().contains(&sid)))
+                        };
+                        let facts = SessionFacts { sid: &sid, expires_ms: current.expires_ms, held, tracked, secure_cookies: app.secure_cookies };
+                        session_panes(sp, &current.login, &facts, &state)
+                    }
+                    Err(error) => format!("<p class=\"problem\">{}</p>", escape(&error)),
+                };
+                format!("{toggle}{session}")
+            }
         };
         let tab_link = |id: &str, href: &str, label: &str| {
             let on = id == tab;
             format!("<a class=\"page-tab\" role=\"tab\" href=\"{href}\" aria-selected=\"{on}\"{}>{label}</a>", if on { " aria-current=\"page\"" } else { "" })
         };
-        let mut body = "<h1>SAML service provider</h1>".to_string();
-        body.push_str(&format!(
-            "<nav class=\"page-tabs\" role=\"tablist\" aria-label=\"Sections\">{}{}</nav><div role=\"tabpanel\" id=\"panel\" data-tab=\"{tab}\">{content}</div>",
+        let count = if events.is_empty() { String::new() } else { events.len().to_string() };
+        let body = format!(
+            "<h1>Signed in as {}</h1><nav class=\"page-tabs\" role=\"tablist\" aria-label=\"Sections\">{}{}{}</nav><p id=\"signal-banner\" class=\"problem\" hidden></p><p id=\"signal-toast\" class=\"notice\" hidden></p><div role=\"tabpanel\" id=\"panel\" data-base=\"\" data-tab=\"{tab}\" data-last-id=\"{last_id}\">{content}</div><script src=\"/app.js\" defer></script><script src=\"/panes.js\" defer></script>",
+            escape(&display_name(&current.login)),
             tab_link("session", "/", "Session"),
+            tab_link("events", "/?tab=events", &format!("CAEP &amp; RISC events <span class=\"count\" id=\"signal-count\">{count}</span>")),
             tab_link("pep", "/?tab=pep", "Policy enforcement"),
-        ));
-        body.push_str("<form method=\"post\" action=\"/logout\"><button type=\"submit\">Log out</button></form>");
-        return page_html("saml2-sp", &body, 200);
+        );
+        return page_for("saml2-sp", &body, 200, Some(&current.login));
     }
-    body.push_str(&format!("<p>Shared Signals: {}</p>", escape(&state)));
+    let mut body = "<h1>Sign in with SAML 2.0</h1>".to_string();
+    if !problem.is_empty() { body.push_str(&format!("<p class=\"problem\">{}</p>", escape(&problem))); }
+    body.push_str(&format!("<p>This application is a SAML 2.0 service provider. It sends the browser to the identity provider with a signed AuthnRequest and accepts the signed (and encrypted) assertion at its assertion consumer service.</p><p>Shared Signals: {}</p>", escape(&state)));
     if problem.is_empty() {
-        body.push_str("<p><a href=\"/login\">Sign in</a></p>");
+        body.push_str("<p class=\"buttons\"><a class=\"button primary\" href=\"/login\">Sign in with SAML 2.0</a></p>");
     }
     page_html("saml2-sp", &body, 200)
+}
+
+/// What the Session tab says about the demo's own session, beside what the
+/// library took from the assertion.
+struct SessionFacts<'a> {
+    sid: &'a str,
+    expires_ms: i64,
+    /// Sessions this process holds.
+    held: usize,
+    /// Whether the Shared Signals receiver tracks this one (None: no receiver).
+    tracked: Option<bool>,
+    secure_cookies: bool,
+}
+
+/// A collapsible pane. The id is stable, so pep.js can keep a pane the
+/// person closed closed across a redraw.
+fn pane(id: &str, title: &str, aside: &str, body: &str) -> String {
+    let aside = if aside.is_empty() { String::new() } else { format!(" <span class=\"aside\">{}</span>", escape(aside)) };
+    format!("<details class=\"card pane\" id=\"{id}\" open><summary><h2>{}</h2>{aside}</summary>{body}</details>", escape(title))
+}
+
+fn facts_table(rows: &[(String, String)]) -> String {
+    let rows: String = rows.iter().map(|(k, v)| format!("<tr><th>{}</th><td>{}</td></tr>", escape(k), escape(v))).collect();
+    format!("<table class=\"facts\">{rows}</table>")
+}
+
+/// A short, non-reversible name for a value this page must not show (a
+/// session cookie, a SessionIndex, a certificate): its SHA-256, shortened.
+fn fingerprint(value: &[u8]) -> String {
+    let digest = <Sha256 as sha2::Digest>::digest(value);
+    let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    format!("sha256 {hex}…")
+}
+
+/// A UTC timestamp, `YYYY-MM-DD HH:MM:SS UTC`, from epoch milliseconds.
+fn utc(ms: i64) -> String {
+    let t = ms.max(0) / 1000;
+    let (days, rem) = (t.div_euclid(86_400), t.rem_euclid(86_400));
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02} UTC", rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
+/// A span of milliseconds in words: `ago` when it is negative.
+fn in_words(ms: i64) -> String {
+    let s = (ms.abs() + 500) / 1000;
+    let text = if s >= 3600 { format!("{}h {}m", s / 3600, s % 3600 / 60) } else if s >= 60 { format!("{}m {}s", s / 60, s % 60) } else { format!("{s}s") };
+    if ms < 0 { format!("{text} ago") } else { text }
+}
+
+/// The attributes the person's email address is read from.
+const MAIL_ATTRIBUTES: &[&str] = &["mail", "email", "urn:oid:0.9.2342.19200300.100.1.3", "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress"];
+/// The attributes the person's display name is read from.
+const NAME_ATTRIBUTES: &[&str] = &["displayName", "urn:oid:2.16.840.1.113730.3.1.241", "cn", "urn:oid:2.5.4.3"];
+
+fn first_of(login: &SamlLogin, names: &[&str]) -> String {
+    names.iter().find_map(|n| login.attributes.get(*n).and_then(|v| v.iter().find(|s| !s.is_empty()))).cloned().unwrap_or_default()
+}
+
+/// Who a sign-in is, as the heading, the menu and /live-status name them:
+/// the username from the assertion's attributes (`SamlLogin::username()`:
+/// username, preferred_username, uid, the AD FS name claim), else the email
+/// address, and the NameID only when the assertion carries neither.
+fn display_name(login: &SamlLogin) -> String {
+    login.username().map(str::to_string).into_iter().chain([first_of(login, MAIL_ATTRIBUTES), login.name_id.clone()]).find(|v| !v.is_empty()).unwrap_or_default()
+}
+
+/// The top bar's user menu: the signed-in account, signing in with another
+/// account (ForceAuthn, so the identity provider asks again), and signing
+/// out. This demo keeps one sign-in per browser, so another account
+/// replaces this one rather than being switched to.
+fn user_menu(login: &SamlLogin) -> String {
+    let name = display_name(login);
+    let initial = name.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "?".into());
+    let detail = [first_of(login, NAME_ATTRIBUTES), first_of(login, MAIL_ATTRIBUTES)].into_iter().find(|v| !v.is_empty() && *v != name).unwrap_or_default();
+    let detail = if detail.is_empty() { String::new() } else { format!("<span class=\"muted small\">{}</span>", escape(&detail)) };
+    format!(
+        "<details class=\"acct-menu\"><summary aria-label=\"Account menu\"><span class=\"avatar\" aria-hidden=\"true\">{i}</span><span class=\"menu-name\" title=\"{n}\">{n}</span><span class=\"caret\" aria-hidden=\"true\">▾</span></summary>\
+<div class=\"menu\" role=\"menu\"><p class=\"menu-head\">Signed in</p>\
+<div class=\"menu-row static\"><span class=\"avatar\" aria-hidden=\"true\">{i}</span><span class=\"menu-who\"><span>{n}</span>{detail}</span></div>\
+<div class=\"menu-sep\"></div>\
+<a class=\"menu-row\" role=\"menuitem\" href=\"/login?force=1\"><span class=\"avatar plus\" aria-hidden=\"true\">+</span>Sign in with another account</a>\
+<p class=\"muted small menu-note\">The identity provider asks who you are (ForceAuthn), even if it already knows. This demo keeps one sign-in per browser: the new account replaces this one.</p>\
+<div class=\"menu-sep\"></div>\
+<form method=\"post\" action=\"/logout\"><button class=\"menu-row\" type=\"submit\" role=\"menuitem\">Sign out {n}</button></form></div></details>",
+        i = escape(&initial),
+        n = escape(&name)
+    )
+}
+
+/// The top bar's links between the demo's pages, for a signed-in person:
+/// the demo itself, and (with the embedded PEP) the two pages the PEP
+/// decides, so each is one click from the others.
+fn site_nav() -> String {
+    #[allow(unused_mut)]
+    let mut links = vec![("/", "Demo home")];
+    #[cfg(feature = "pep")]
+    links.extend([("/attribute-protected", "Attribute-protected"), ("/orders/42", "Order 42")]);
+    let items: Vec<String> = links.iter().map(|(href, label)| format!("<a href=\"{href}\">{label}</a>")).collect();
+    format!("<nav class=\"site-nav\" aria-label=\"Demo pages\">{}</nav>", items.join(""))
+}
+
+/// The Session tab: what protects the sign-in, who signed in (the
+/// assertion's attributes), the demo's session cache and the credentials.
+/// The assertion itself is not kept (only what the library took from it),
+/// and the values that act as credentials (the session cookie, the
+/// SessionIndex) are shown by a fingerprint, never as they are.
+fn session_panes(sp: &ServiceProvider, login: &SamlLogin, facts: &SessionFacts, stream: &str) -> String {
+    let c = &sp.config;
+    let certs: Vec<String> = sp.idp.certs.iter().map(|der| fingerprint(der)).collect();
+    let signature = if c.want_assertions_signed { "the assertion's own signature is required (wantAssertionsSigned)" } else { "the Response's or the assertion's signature is required" };
+    let encryption = match (c.want_assertions_encrypted, login.encrypted) {
+        (true, _) => "required (wantAssertionsEncrypted): an EncryptedAssertion, decrypted with privateKey",
+        (false, true) => "this one was encrypted (an EncryptedAssertion, decrypted with privateKey); not required",
+        (false, false) => "not required, and this one was not encrypted",
+    };
+    let protections = [
+        ("AuthnRequest", format!("signed with privateKey (RSA-SHA256), sent by HTTP-{}", if c.request_binding == "post" { "POST" } else { "Redirect" })),
+        ("Signature", format!("{signature}, checked against the identity provider's {} signing certificate(s) ({})", certs.len(), certs.join(", "))),
+        ("Encryption", encryption.to_string()),
+        ("InResponseTo", if c.allow_unsolicited { "unsolicited responses are allowed".to_string() } else { "must name an AuthnRequest this browser sent (the saml_pending cookie)".to_string() }),
+        ("Audience and recipient", format!("AudienceRestriction must name {}, SubjectConfirmationData's Recipient {}", c.entity_id, c.acs_url)),
+        ("Validity", format!("Conditions NotBefore / NotOnOrAfter and the bearer confirmation's NotOnOrAfter are checked with {} ms of clock skew", c.clock_skew_ms)),
+        ("Replay", "each assertion ID is accepted once (the replay cache)".to_string()),
+        ("TLS", if c.idp_ca.is_empty() { "the identity provider is verified against the system's roots".to_string() } else { "the identity provider is verified against idpCa's trust chain".to_string() }),
+        ("Session", format!("server-side, in this process; the browser holds only the sid cookie (HttpOnly, SameSite=Lax{})", if facts.secure_cookies { ", Secure" } else { "" })),
+        ("Shared Signals", if stream.is_empty() { "not running".to_string() } else { stream.to_string() }),
+    ];
+    let list: String = protections.iter().map(|(k, v)| format!("<li><strong>{}</strong> <span class=\"muted\">{}</span></li>", escape(k), escape(v))).collect();
+    let mut out = pane("security-card", "Protections in effect", "", &format!("<ul class=\"checks\">{list}</ul>"));
+
+    let now = now_ms();
+    let signed_in = if login.authn_instant_ms > 0 { format!("signed in {}", in_words(login.authn_instant_ms - now)) } else { String::new() };
+    let when = |ms: i64| format!("{} ({})", utc(ms), in_words(ms - now));
+    let mut who = vec![
+        ("NameID".to_string(), login.name_id.clone()),
+        ("NameID format".into(), login.name_id_format.clone()),
+        ("Issuer".into(), login.issuer.clone()),
+        ("AuthnInstant".into(), if login.authn_instant_ms > 0 { when(login.authn_instant_ms) } else { "not stated".into() }),
+        ("AuthnContextClassRef".into(), login.authn_context_class_ref.clone()),
+        ("SessionNotOnOrAfter".into(), login.session_not_on_or_after_ms.map(when).unwrap_or_else(|| "not stated".into())),
+    ];
+    if !login.name_qualifier.is_empty() { who.push(("NameQualifier".into(), login.name_qualifier.clone())); }
+    if !login.sp_name_qualifier.is_empty() { who.push(("SPNameQualifier".into(), login.sp_name_qualifier.clone())); }
+    let who: Vec<(String, String)> = who.into_iter().map(|(k, v)| (k, if v.is_empty() { "—".into() } else { v })).collect();
+    let mut names: Vec<&String> = login.attributes.keys().collect();
+    names.sort();
+    let attributes: String = names.iter().map(|n| {
+        let friendly = login.attribute_friendly_names.get(*n).filter(|f| !f.is_empty()).map(|f| format!(" <small>({})</small>", escape(f))).unwrap_or_default();
+        format!("<tr><th>{}{friendly}</th><td>{}</td></tr>", escape(n), escape(&login.attributes[*n].join(", ")))
+    }).collect();
+    let attributes = if names.is_empty() { "<p><small>The assertion carried no attributes.</small></p>".to_string() } else { format!("<table class=\"facts\">{attributes}</table>") };
+    out.push_str(&pane("session-card", "Session", &signed_in, &format!(
+        "{}<h3>Attributes</h3><p><small>Every attribute of the assertion's AttributeStatement, as the library accepted it (by Name, with its FriendlyName).</small></p>{attributes}",
+        facts_table(&who)
+    )));
+
+    let tracked = match facts.tracked {
+        Some(true) => "yes: a CAEP or RISC event about this person or session ends it",
+        Some(false) => "no",
+        None => "no receiver is running",
+    };
+    let ends = if login.session_not_on_or_after_ms.is_some_and(|limit| limit <= facts.expires_ms) { "the assertion's SessionNotOnOrAfter" } else { "the demo's 8-hour limit" };
+    let cache = vec![
+        ("Expires".to_string(), when(facts.expires_ms)),
+        ("Set by".into(), ends.into()),
+        ("Sessions in this process".into(), facts.held.to_string()),
+        ("Tracked for Shared Signals".into(), tracked.into()),
+        ("Kept".into(), "in this process's memory: the validated sign-in, never the assertion's XML".into()),
+    ];
+    out.push_str(&pane("cache-card", "Session cache", &format!("expires in {}", in_words(facts.expires_ms - now).trim_end_matches(" ago")), &facts_table(&cache)));
+
+    let encrypted = if login.encrypted { "yes (EncryptedAssertion)" } else { "no" };
+    let assertion = vec![
+        ("Assertion ID".to_string(), login.assertion_id.clone()),
+        ("Response ID".into(), login.response_id.clone()),
+        ("Binding".into(), login.binding.clone()),
+        ("Encrypted".into(), encrypted.into()),
+        ("Signature".into(), format!("verified before anything in it was read ({signature})")),
+        ("InResponseTo".into(), login.in_response_to.clone().unwrap_or_else(|| "— (unsolicited)".into())),
+    ];
+    let secrets = vec![
+        ("Session cookie (sid)".to_string(), fingerprint(facts.sid.as_bytes())),
+        ("SessionIndex".into(), if login.session_index.is_empty() { "none was sent".into() } else { fingerprint(login.session_index.as_bytes()) }),
+    ];
+    out.push_str(&pane("credentials-card", "Credentials", "", &format!(
+        "<p><small>The values stay in this process: each is shown by a fingerprint. The assertion's XML is not kept; this is what the library took from it.</small></p><h3>SAML assertion</h3>{}<h3>Session</h3>{}",
+        facts_table(&assertion),
+        facts_table(&secrets)
+    )));
+    out
+}
+
+fn family_of(event_type: &str) -> &'static str {
+    if event_type.contains("/caep/") {
+        "CAEP"
+    } else if event_type.contains("/risc/") {
+        "RISC"
+    } else if event_type.contains("/ssf/") {
+        "SSF"
+    } else {
+        "STS"
+    }
+}
+
+fn remember_live_event(events: &Mutex<Vec<LiveEvent>>, seq: &std::sync::atomic::AtomicU64, signal: &SignalEvent) {
+    let mut subject: Vec<String> = signal.subject.iter().map(|(k, v)| format!("{k} {v}")).collect();
+    subject.sort();
+    let live = LiveEvent {
+        id: seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+        event_type: signal.event_type.clone(),
+        jti: signal.jti.clone(),
+        family: family_of(&signal.event_type).to_string(),
+        at: utc(signal.iat.map(|t| (t * 1000.0) as i64).unwrap_or_else(now_ms)),
+        subject: subject.join(", "),
+        members: Value::Object(signal.payload.clone()),
+        ended: signal.ended,
+    };
+    let mut events = events.lock().expect("events");
+    events.push(live);
+    let over = events.len().saturating_sub(MAX_EVENTS);
+    events.drain(..over);
+}
+
+fn event_json(event: &LiveEvent) -> Value {
+    json!({
+        "id": event.id, "type": event.event_type, "jti": event.jti, "family": event.family,
+        "at": event.at, "subject": event.subject, "members": event.members, "ended": event.ended,
+        "about": if event.family == "SSF" { "stream" } else { "subject" },
+    })
+}
+
+/// One log entry: the same markup `app.js`'s `entryNode()` draws.
+fn event_item(event: &LiveEvent) -> String {
+    let short = event.event_type.rsplit("/event-type/").next().unwrap_or(&event.event_type);
+    let outcome = if event.family == "SSF" {
+        "about the stream: the verification this session asked for"
+    } else if event.ended {
+        "ended this session"
+    } else {
+        "recorded; this session continues"
+    };
+    let mut out = format!(
+        "<li class=\"log-item\" data-id=\"{}\"><div class=\"log-top\"><span class=\"badge {}\">{}</span> <strong>{}</strong> <time>{}</time></div><p class=\"log-outcome{}\">{}</p>",
+        event.id,
+        escape(&event.family.to_lowercase()),
+        escape(&event.family),
+        escape(short),
+        escape(&event.at),
+        if event.ended { " ended" } else { "" },
+        outcome
+    );
+    if !event.subject.is_empty() {
+        out.push_str(&format!("<p><small>Subject: {}</small></p>", escape(&event.subject)));
+    }
+    if let Some(members) = event.members.as_object().filter(|m| m.keys().any(|k| k != "subject")) {
+        out.push_str("<table class=\"facts members\">");
+        for (name, value) in members {
+            if name == "subject" {
+                continue;
+            }
+            let text = match value {
+                Value::String(s) => s.clone(),
+                Value::Object(o) if !o.is_empty() && o.values().all(|v| v.is_string()) => o.values().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" / "),
+                other => other.to_string(),
+            };
+            out.push_str(&format!("<tr><th>{}</th><td>{}</td></tr>", escape(name), escape(&text)));
+        }
+        out.push_str("</table>");
+    }
+    out.push_str(&format!("<p><small>jti {}</small></p></li>", escape(&event.jti)));
+    out
+}
+
+/// The CAEP & RISC events tab: whose events these are, the stream and the
+/// verification request, and the log, newest first, each a collapsible
+/// pane. `app.js` adds what arrives without reloading.
+fn events_panel(events: &[LiveEvent], stream: &str, notice: &str) -> String {
+    let items: String = events.iter().rev().map(event_item).collect();
+    let notice = if notice.is_empty() { String::new() } else { format!("<p class=\"notice\">{}</p>", escape(notice)) };
+    // The one stream is the service provider's, so the log is too: a real
+    // application shows a person only the events about their own session
+    // or account, and keeps the rest from them.
+    let scope = pane("events-scope", "Whose events these are", "", "<p class=\"warning\"><strong>Every event this application received, for every user.</strong> This tab lists all the CAEP and RISC events the service provider's Shared Signals stream delivered: events about other people's sessions and accounts as well as yours. That is for this demonstration only. A real application must take additional safeguards: show a person only the events about their own session or account, and keep the others to the people whose job is to see them.</p>");
+    let stream_pane = pane("events-stream", "Shared Signals stream", "", &format!(
+        "<table class=\"facts\"><tr><th>Stream status</th><td id=\"stream-status\">{}</td></tr><tr><th>Live</th><td id=\"live-state\">connecting…</td></tr></table>\
+<form id=\"verify-form\" method=\"post\" action=\"/signals/verify\"><button type=\"submit\">Ask for a verification event</button></form>",
+        escape(stream)
+    ));
+    let count = if events.is_empty() { String::new() } else { format!("{} event(s)", events.len()) };
+    let log_pane = pane("events-log", "Event log", &count, &format!(
+        "<p><small>The CAEP and RISC events this service provider's receiver has accepted, about anybody, newest first, and the verification events it asked for. Each appears here within moments of the receiver getting it.</small></p>\
+<ol class=\"log\" id=\"log\">{items}</ol>\
+<p class=\"empty\" id=\"log-empty\"{}>No CAEP or RISC event yet. At iya-sts, change this person's password (credential-change), sign them out (session-revoked), or disable them (account-disabled), and watch this tab.</p>",
+        if events.is_empty() { "" } else { " hidden" }
+    ));
+    format!("{notice}{scope}{stream_pane}{log_pane}")
+}
+
+/// `GET /api/signals?after=<id>`: what arrived after the last event the
+/// page shows, and the stream's state. 401 once the session is gone, which
+/// `app.js` reads as signed out.
+fn signals_api(app: &App, req: &Request) -> Response {
+    if current_session(app, req).is_none() {
+        return text(401, "application/json", &json!({"signedIn": false}).to_string());
+    }
+    let after = query_value(&req.query, "after").parse::<u64>().unwrap_or(0);
+    let events: Vec<Value> = app.events.lock().expect("events").iter().filter(|e| e.id > after).map(event_json).collect();
+    let body = json!({"events": events, "streamStatus": {"status": app.receiver_state.lock().expect("state").clone(), "at": utc(now_ms())}});
+    text(200, "application/json", &body.to_string())
+}
+
+/// `POST /signals/verify`: asks the transmitter for a verification event on
+/// the stream. JSON for `app.js`, a redirect back to the tab without it.
+fn verify_signals(app: &App, req: &Request) -> Response {
+    if current_session(app, req).is_none() {
+        return Response { status: 303, headers: vec![("location".into(), "/".into())], body: Vec::new() };
+    }
+    let state = format!("demo-{}", app.event_seq.load(std::sync::atomic::Ordering::Relaxed) + 1);
+    let outcome = match app.receiver.lock().expect("receiver").as_ref().map(|r| r.verify(&state)) {
+        Some(Ok(())) => "sent",
+        Some(Err(error)) => {
+            println!("ssf: verification request refused: {error}");
+            "refused"
+        }
+        None => "refused",
+    };
+    if req.headers.get("accept").is_some_and(|a| a.contains("application/json")) {
+        text(200, "application/json", &json!({"outcome": outcome}).to_string())
+    } else {
+        Response { status: 303, headers: vec![("location".into(), format!("/?tab=events&verify={outcome}"))], body: Vec::new() }
+    }
 }
 
 fn login(app: &App, req: &Request) -> Response {
@@ -576,7 +1014,10 @@ fn login(app: &App, req: &Request) -> Response {
     let asked = query_value(&req.query, "binding");
     let response_binding = if asked == "post" || asked == "redirect" || asked == "artifact" { asked } else { String::new() };
     let nonce = b64url(&random(16));
-    let made = sp.login(&LoginOptions { relay_state: Some("/".into()), nonce: nonce.clone(), response_binding, ..LoginOptions::default() });
+    // The user menu's "Sign in with another account": ForceAuthn, so the
+    // identity provider asks who it is even if it already knows.
+    let force_authn = query_value(&req.query, "force") == "1";
+    let made = sp.login(&LoginOptions { relay_state: Some("/".into()), nonce: nonce.clone(), response_binding, force_authn, ..LoginOptions::default() });
     let made = match made {
         Ok(made) => made,
         Err(error) => return page_html("Sign-in", &format!("<h1>Sign-in failed</h1><p class=\"problem\">{}</p>", escape(&error.to_string())), 400),
@@ -670,7 +1111,19 @@ fn unseal(app: &App, value: &str) -> Map<String, Value> {
 }
 
 fn page_html(title: &str, body: &str, status: u16) -> Response {
-    let html = format!("<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>{}</title><link rel=\"stylesheet\" href=\"/styles.css\"></head><body>{body}</body></html>", escape(title));
+    page_for(title, body, status, None)
+}
+
+/// A page, with the demo's links and the user menu in the top bar when
+/// someone is signed in.
+fn page_for(title: &str, body: &str, status: u16, who: Option<&SamlLogin>) -> Response {
+    let menu = who.map(user_menu).unwrap_or_default();
+    let nav = if who.is_some() { site_nav() } else { String::new() };
+    let script = if who.is_some() { "<script src=\"/menu.js\" defer></script>" } else { "" };
+    let html = format!(
+        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>{}</title><link rel=\"stylesheet\" href=\"/styles.css\"></head><body><header class=\"topbar\"><a href=\"/\">saml2-sp demo</a>{nav}{menu}</header><main>{body}</main><footer>A web application signing in with SAML 2.0 through saml2-sp.</footer>{script}</body></html>",
+        escape(title)
+    );
     let mut response = text(status, "text/html; charset=utf-8", &html);
     // connect-src 'self' is what lets pep.js fetch the tab's fragment.
     response.headers.push(("content-security-policy".into(), PAGE_CSP.into()));
@@ -785,7 +1238,53 @@ mod tests {
             port: 0, public_url: String::new(), public_given: false, config_path: "/nonexistent/saml.json".into(), secret: vec![7; 32],
             secure_cookies: false, ssf_transmitter: String::new(), ssf_poll_ms: 0, receiver: Arc::new(Mutex::new(None)),
             receiver_state: Arc::new(Mutex::new(String::new())), sessions: Arc::new(Mutex::new(HashMap::new())), events: Arc::new(Mutex::new(Vec::new())),
+            event_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// A sign-in as iya-sts writes one: a transient NameID, and the
+    /// username under uid, its OID and the AD FS name claim.
+    fn alice() -> SamlLogin {
+        let mut attributes = HashMap::new();
+        for name in ["uid", "urn:oid:0.9.2342.19200300.100.1.1", "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name"] {
+            attributes.insert(name.to_string(), vec!["alice".to_string()]);
+        }
+        attributes.insert("mail".into(), vec!["alice@example.com".into()]);
+        attributes.insert("displayName".into(), vec!["<Alice> Admin".into()]);
+        attributes.insert("groups".into(), vec!["staff".into(), "<admins>".into()]);
+        let mut friendly = HashMap::new();
+        friendly.insert("urn:oid:0.9.2342.19200300.100.1.1".to_string(), "uid".to_string());
+        SamlLogin {
+            name_id: "_transient-7f3a".into(), name_id_format: "urn:oasis:names:tc:SAML:2.0:nameid-format:transient".into(),
+            name_qualifier: String::new(), sp_name_qualifier: String::new(), session_index: "idp-session-secret-1".into(),
+            session_not_on_or_after_ms: Some(now_ms() + 3_600_000), authn_instant_ms: now_ms() - 60_000,
+            authn_context_class_ref: "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport".into(),
+            attributes, attribute_friendly_names: friendly, issuer: "https://idp.test/realm/r1".into(), in_response_to: Some("_req1".into()),
+            relay_state: None, binding: "post".into(), encrypted: true, response_id: "_resp1".into(), assertion_id: "_assert1".into(),
+        }
+    }
+
+    fn live(id: u64, event_type: &str, ended: bool) -> LiveEvent {
+        LiveEvent {
+            id, event_type: event_type.into(), jti: format!("j<{id}>"), family: family_of(event_type).into(),
+            at: utc(1_795_000_000_000), subject: "format email, email <a@x>".into(),
+            members: json!({"reason_admin": {"en": "<b>gone</b>"}, "subject": {"x": 1}}), ended,
+        }
+    }
+
+    /// A service provider on throwaway keys, with an optional `pep` section.
+    fn sp_with(pep: Option<Value>) -> ServiceProvider {
+        let sp_keys = saml2_sp::create_self_signed_key_pair("sp.demo.test", 1, 2048).unwrap();
+        let idp_keys = saml2_sp::create_self_signed_key_pair("idp.demo.test", 1, 2048).unwrap();
+        let body: String = idp_keys.certificate_pem.lines().filter(|l| !l.starts_with("-----")).collect();
+        let metadata = format!("<md:EntityDescriptor xmlns:md=\"urn:oasis:names:tc:SAML:2.0:metadata\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\" entityID=\"http://127.0.0.1:9\"><md:IDPSSODescriptor protocolSupportEnumeration=\"urn:oasis:names:tc:SAML:2.0:protocol\"><md:KeyDescriptor use=\"signing\"><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{body}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor><md:SingleSignOnService Binding=\"urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect\" Location=\"http://127.0.0.1:9/sso\"/></md:IDPSSODescriptor></md:EntityDescriptor>");
+        let mut config: Map<String, Value> = serde_json::from_value(json!({
+            "entityId": "http://127.0.0.1:9/saml/metadata", "acsUrl": "http://127.0.0.1:9/saml/acs",
+            "privateKey": sp_keys.private_key_pem, "certificate": sp_keys.certificate_pem, "idpMetadata": metadata,
+            "signals": false,
+        })).unwrap();
+        if let Some(pep) = pep { config.insert("pep".into(), pep); }
+        ServiceProvider::create(&config, "", None).unwrap()
     }
 
     fn get(path: &str) -> Request {
@@ -822,19 +1321,9 @@ mod tests {
     #[cfg(feature = "pep")]
     #[test]
     fn the_tab_draws_every_pane_and_escapes() {
-        let sp_keys = saml2_sp::create_self_signed_key_pair("sp.demo.test", 1, 2048).unwrap();
-        let idp_keys = saml2_sp::create_self_signed_key_pair("idp.demo.test", 1, 2048).unwrap();
-        let body: String = idp_keys.certificate_pem.lines().filter(|l| !l.starts_with("-----")).collect();
-        let metadata = format!("<md:EntityDescriptor xmlns:md=\"urn:oasis:names:tc:SAML:2.0:metadata\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\" entityID=\"http://127.0.0.1:9\"><md:IDPSSODescriptor protocolSupportEnumeration=\"urn:oasis:names:tc:SAML:2.0:protocol\"><md:KeyDescriptor use=\"signing\"><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{body}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor><md:SingleSignOnService Binding=\"urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect\" Location=\"http://127.0.0.1:9/sso\"/></md:IDPSSODescriptor></md:EntityDescriptor>");
         let key = std::env::temp_dir().join(format!("saml-demo-pep-{}.pem", std::process::id()));
         std::fs::write(&key, rcgen::KeyPair::generate().unwrap().serialize_pem()).unwrap();
-        let config: Map<String, Value> = serde_json::from_value(json!({
-            "entityId": "http://127.0.0.1:9/saml/metadata", "acsUrl": "http://127.0.0.1:9/saml/acs",
-            "privateKey": sp_keys.private_key_pem, "certificate": sp_keys.certificate_pem, "idpMetadata": metadata,
-            "signals": false,
-            "pep": {"name": "pep-demo", "application": "orders<&\"app\">", "mode": "central", "assertionKey": key.to_string_lossy(), "timeoutMs": 300}
-        })).unwrap();
-        let sp = ServiceProvider::create(&config, "", None).unwrap();
+        let sp = sp_with(Some(json!({"name": "pep-demo", "application": "orders<&\"app\">", "mode": "central", "assertionKey": key.to_string_lossy(), "timeoutMs": 300})));
         let _ = std::fs::remove_file(&key);
         let login = SamlLogin {
             name_id: "alice".into(), name_id_format: String::new(), name_qualifier: String::new(), sp_name_qualifier: String::new(),
@@ -853,7 +1342,141 @@ mod tests {
         assert!(html.contains("Permit cache"), "central mode shows the cache");
         assert!(html.contains("<td>orders&lt;&amp;&quot;app&quot;&gt;</td>") && !html.contains("orders<&"), "the application is escaped");
         assert!(!html.contains("<script"), "the fragment carries no script");
+        assert!(html.contains("<details class=\"card pane\" id=\"pep-problems\" open>"), "the problem is a pane too");
+        assert!(html.contains("<details class=\"card pane\" id=\"pep-try\" open>") && html.contains("href=\"/attribute-protected\"") && html.contains("href=\"/orders/42\""), "Try it links the two protected pages");
         let v = pep_json(Some(&sp));
         assert_eq!((v["enabled"].clone(), v["mode"].clone(), v["decisions"]["unavailable"].clone()), (json!(true), json!("central"), json!(1)));
+    }
+
+    #[test]
+    fn the_events_tab_draws_each_event_newest_first_and_escapes() {
+        let caep = "https://schemas.openid.net/secevent/caep/event-type/session-revoked";
+        let risc = "https://schemas.openid.net/secevent/risc/event-type/account-disabled";
+        let html = events_panel(&[live(1, caep, true), live(2, risc, false)], "polling <s>", "");
+        assert!(html.find("data-id=\"2\"").unwrap() < html.find("data-id=\"1\"").unwrap(), "newest first");
+        assert!(html.contains("<span class=\"badge caep\">CAEP</span> <strong>session-revoked</strong>"));
+        assert!(html.contains("<span class=\"badge risc\">RISC</span>"));
+        assert!(html.contains("ended this session") && html.contains("recorded; this session continues"));
+        assert!(html.contains("&lt;b&gt;gone&lt;/b&gt;") && !html.contains("<b>gone"), "members escaped");
+        assert!(html.contains("polling &lt;s&gt;") && html.contains("j&lt;1&gt;") && html.contains("&lt;a@x&gt;"));
+        assert!(!html.contains("<th>subject</th>"), "the subject member is the Subject line, not a row");
+        assert!(html.contains("id=\"log-empty\" hidden"), "the empty note hidden once there are events");
+        assert!(events_panel(&[], "", "").contains("id=\"log-empty\">"), "and shown when there are none");
+        let empty = events_panel(&[], "", "refused <x>");
+        assert!(empty.contains("<p class=\"warning\"><strong>Every event this application received, for every user.</strong>") && empty.contains("additional safeguards"), "it says whose events these are, with or without any");
+        assert!(empty.contains("refused &lt;x&gt;"));
+        for id in ["events-scope", "events-stream", "events-log"] {
+            assert!(html.contains(&format!("<details class=\"card pane\" id=\"{id}\" open>")), "{id} is a collapsible pane");
+        }
+        assert!(html.contains("id=\"live-state\"") && html.contains("id=\"stream-status\"") && html.contains("id=\"verify-form\"") && html.contains("id=\"log\""), "app.js finds what it updates");
+    }
+
+    #[test]
+    fn a_received_event_is_kept_and_handed_to_app_js_in_the_shape_it_reads() {
+        let events = Mutex::new(Vec::new());
+        let seq = std::sync::atomic::AtomicU64::new(0);
+        let mut payload = Map::new();
+        payload.insert("reason_admin".into(), json!({"en": "x"}));
+        let mut subject = HashMap::new();
+        subject.insert("format".to_string(), "email".to_string());
+        let signal = SignalEvent { event_type: "https://schemas.openid.net/secevent/ssf/event-type/verification".into(), payload, subject, jti: "j1".into(), sessions: Vec::new(), ended: false, iat: Some(1_795_000_000.0), txn: None };
+        for _ in 0..(MAX_EVENTS + 3) {
+            remember_live_event(&events, &seq, &signal);
+        }
+        let kept = events.lock().unwrap();
+        assert_eq!(kept.len(), MAX_EVENTS, "the oldest go first");
+        assert_eq!(kept.last().unwrap().id, MAX_EVENTS as u64 + 3, "ids keep counting");
+        let e = event_json(kept.last().unwrap());
+        assert_eq!((e["family"].clone(), e["about"].clone(), e["jti"].clone()), (json!("SSF"), json!("stream"), json!("j1")));
+        assert_eq!(e["at"], "2026-11-18 11:06:40 UTC");
+        assert_eq!(e["subject"], "format email");
+        assert_eq!(family_of("urn:iya:sts:secevent:event-type:pep-policies-changed"), "STS");
+        assert_eq!(utc(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!((in_words(90_000), in_words(-3_700_000)), ("1m 30s".to_string(), "1h 1m ago".to_string()));
+    }
+
+    #[test]
+    fn the_signals_routes_need_a_session() {
+        let app = app();
+        assert_eq!(route(&app, &get("/api/signals")).status, 401);
+        let mut post = get("/signals/verify");
+        post.method = "POST".into();
+        let answer = route(&app, &post);
+        assert_eq!((answer.status, answer.headers.iter().find(|(k, _)| k == "location").map(|(_, v)| v.as_str())), (303, Some("/")));
+        assert_eq!(route(&app, &get("/events")).status, 204, "no SSE: app.js polls instead");
+        #[cfg(feature = "pep")]
+        assert_eq!(route(&app, &get("/attribute-protected")).status, 401, "the PEP's pages need a sign-in first");
+    }
+
+    #[test]
+    fn the_name_shown_is_the_username_never_the_nameid_when_there_is_one() {
+        let login = alice();
+        assert_eq!(display_name(&login), "alice", "the uid attribute, not the transient NameID");
+        let menu = user_menu(&login);
+        assert!(menu.contains("title=\"alice\">alice</span>") && menu.contains("Sign out alice"), "{menu}");
+        assert!(menu.contains("<span class=\"avatar\" aria-hidden=\"true\">A</span>"));
+        assert!(menu.contains("&lt;Alice&gt; Admin") && !menu.contains("<Alice>"), "the display name is the detail line, escaped");
+        assert!(menu.contains("href=\"/login?force=1\""), "another account: ForceAuthn");
+        assert!(menu.contains("<form method=\"post\" action=\"/logout\"><button class=\"menu-row\""), "sign out is a POST, in the menu");
+        let mut mail_only = alice();
+        mail_only.attributes.retain(|k, _| k == "mail");
+        assert_eq!(display_name(&mail_only), "alice@example.com", "no username: the email");
+        mail_only.attributes.clear();
+        assert_eq!(display_name(&mail_only), "_transient-7f3a", "the NameID only when nothing else names them");
+        let mut preferred = alice();
+        preferred.attributes.insert("preferred_username".into(), vec!["al".into()]);
+        assert_eq!(display_name(&preferred), "al", "preferred_username before uid");
+    }
+
+    #[test]
+    fn the_top_bar_links_the_demo_pages_and_holds_the_menu_once_signed_in() {
+        let html = |r: Response| String::from_utf8(r.body).unwrap();
+        let signed_in = html(page_for("t", "", 200, Some(&alice())));
+        assert!(signed_in.contains("class=\"site-nav\"") && signed_in.contains("href=\"/\">Demo home</a>"), "{signed_in}");
+        #[cfg(feature = "pep")]
+        assert!(signed_in.contains("href=\"/attribute-protected\"") && signed_in.contains("href=\"/orders/42\""), "{signed_in}");
+        assert!(signed_in.contains("acct-menu") && signed_in.contains("/menu.js"));
+        let anonymous = html(page_html("t", "", 200));
+        assert!(!anonymous.contains("site-nav") && !anonymous.contains("acct-menu") && !anonymous.contains("/logout"), "nothing to link to before a sign-in");
+        let home = html(route(&app(), &get("/")));
+        assert!(!home.contains("action=\"/logout\""), "sign-out is only in the menu");
+    }
+
+    #[test]
+    fn the_session_tab_shows_the_assertion_never_its_secrets() {
+        let sp = sp_with(None);
+        let login = alice();
+        let facts = SessionFacts { sid: "the-session-cookie-value", expires_ms: now_ms() + 3_600_000, held: 1, tracked: Some(true), secure_cookies: true };
+        let html = session_panes(&sp, &login, &facts, "polling <stream>");
+        for id in ["security-card", "session-card", "cache-card", "credentials-card"] {
+            assert!(html.contains(&format!("<details class=\"card pane\" id=\"{id}\" open>")), "{id} is a collapsible pane");
+        }
+        assert!(!html.contains("the-session-cookie-value") && html.contains(&fingerprint(b"the-session-cookie-value")), "the cookie by its fingerprint");
+        assert!(!html.contains("idp-session-secret-1") && html.contains(&fingerprint(b"idp-session-secret-1")), "the SessionIndex by its fingerprint");
+        assert!(html.contains(&fingerprint(&sp.idp.certs[0])), "the identity provider's signing certificate, by fingerprint");
+        assert!(html.contains("<th>groups</th><td>staff, &lt;admins&gt;</td>"), "every attribute, escaped: {html}");
+        assert!(html.contains("<th>urn:oid:0.9.2342.19200300.100.1.1 <small>(uid)</small></th>"), "with its FriendlyName");
+        assert!(html.contains("_assert1") && html.contains("_resp1") && html.contains("yes (EncryptedAssertion)"));
+        assert!(html.contains("AudienceRestriction must name http://127.0.0.1:9/saml/metadata"));
+        assert!(html.contains("polling &lt;stream&gt;") && html.contains("HttpOnly, SameSite=Lax, Secure"));
+        assert!(html.contains("the assertion&#39;s SessionNotOnOrAfter") || html.contains("the assertion's SessionNotOnOrAfter"), "the session ends with the assertion's limit");
+        assert!(html.find(">groups<").unwrap() < html.find(">mail<").unwrap(), "attributes sorted by name");
+    }
+
+    #[test]
+    fn the_panes_toggle_ships_hidden_and_every_script_keeps_its_names_to_itself() {
+        let main = include_str!("demo.rs");
+        assert!(main.contains("id=\\\"panes-toggle\\\" hidden>Collapse all"), "hidden until panes.js shows it");
+        let panes = include_str!("../../demo/public/panes.js");
+        assert!(panes.contains("panes-toggle") && panes.contains("Expand all") && panes.contains("panes-redrawn"));
+        assert!(include_str!("../../demo/public/pep.js").contains("panes-redrawn"), "pep.js tells the toggle when it redrew");
+        // The page's scripts share one global scope: two top-level `const`s of
+        // one name make the later script fail to load. Each is its own function.
+        for (name, src) in [("app.js", include_str!("../../demo/public/app.js")), ("pep.js", include_str!("../../demo/public/pep.js")), ("panes.js", panes), ("menu.js", include_str!("../../demo/public/menu.js"))] {
+            let code: Vec<&str> = src.lines().filter(|l| !l.trim_start().starts_with("//") && !l.trim().is_empty()).collect();
+            assert_eq!(code.first().copied(), Some("(() => {"), "{name} opens its own scope");
+            assert_eq!(code.last().copied(), Some("})();"), "{name} closes it");
+        }
+        assert!(include_str!("../../demo/public/styles.css").contains("[hidden] { display: none !important; }"), "hidden hides a button too");
     }
 }
