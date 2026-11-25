@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
-use saml2_sp::{AcsBody, LoginOptions, ReceiverOptions, SamlLogin, ServiceProvider, SignalEvent, SignalsReceiver, TlsOptions};
+use saml2_sp::{AcsBody, LoginOptions, ReceiverOptions, SamlLogin, ServiceProvider, SignalEvent, SignalsReceiver};
 use serde_json::{json, Map, Value};
 use sha2::Sha256;
 
@@ -242,8 +242,9 @@ fn start_receiver(app: &App, sp: &ServiceProvider) {
         return;
     }
     if app.ssf_transmitter.is_empty() { return; }
-    let mut tls = TlsOptions { cert: sp.config.certificate_pem.clone(), key: sp.config.private_key_pem.clone(), ca: String::new() };
-    if !sp.config.idp_ca.is_empty() { tls.ca = sp.config.idp_ca.clone(); }
+    // The receiver's own TLS client identity (ssf.clientCertificate / ssf.clientKey,
+    // the certificate the realm issued the application), else the SP key pair.
+    let tls = sp.config.ssf_tls();
     let entity = sp.config.entity_id.clone();
     let sessions = app.sessions.clone();
     let built = SignalsReceiver::new(ReceiverOptions {
@@ -811,7 +812,9 @@ fn session_panes(sp: &ServiceProvider, login: &SamlLogin, facts: &SessionFacts, 
         ("Replay", "each assertion ID is accepted once (the replay cache)".to_string()),
         ("TLS", if c.idp_ca.is_empty() { "the identity provider is verified against the system's roots".to_string() } else { "the identity provider is verified against idpCa's trust chain".to_string() }),
         ("Session", format!("server-side, in this process; the browser holds only the sid cookie (HttpOnly, SameSite=Lax{})", if facts.secure_cookies { ", Secure" } else { "" })),
-        ("Shared Signals", if stream.is_empty() { "not running".to_string() } else { stream.to_string() }),
+        ("Shared Signals", if stream.is_empty() { "not running".to_string() } else {
+            format!("{stream}; authenticated to the transmitter by mutual TLS with {}", if c.ssf_client_is_separate() { "its own client certificate (ssf.clientCertificate)" } else { "the SP key pair" })
+        }),
     ];
     let list: String = protections.iter().map(|(k, v)| format!("<li><strong>{}</strong> <span class=\"muted\">{}</span></li>", escape(k), escape(v))).collect();
     let mut out = pane("security-card", "Protections in effect", "", &format!("<ul class=\"checks\">{list}</ul>"));

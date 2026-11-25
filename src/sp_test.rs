@@ -411,3 +411,62 @@ fn a_pep_section_is_refused_without_the_pep_feature() {
     extra.insert("pep".into(), serde_json::Value::Null);
     assert!(ServiceProvider::create(&test_config(extra, ""), "", None).is_ok(), "a null section is no section");
 }
+
+/// The Shared Signals receiver's TLS client identity: `ssf.clientCertificate`
+/// and `ssf.clientKey` when given (a realm-issued EC certificate, separate
+/// from the SAML key pair), else the SP key pair; both or neither.
+#[test]
+fn the_receiver_has_its_own_tls_client_identity_or_falls_back_to_the_sp_key_pair() {
+    let plain = resolve(test_config(serde_json::Map::new(), "")).unwrap();
+    let tls = plain.ssf_tls();
+    assert!(!plain.ssf_client_is_separate());
+    assert_eq!((tls.cert.as_str(), tls.key.as_str()), (plain.certificate_pem.as_str(), plain.private_key_pem.as_str()), "no ssf client: the SP key pair");
+
+    let ec = rcgen::KeyPair::generate().unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.distinguished_name.push(rcgen::DnType::CommonName, "realm-issued");
+    let cert = params.self_signed(&ec).unwrap().pem();
+    let dir = std::env::temp_dir().join(format!("saml2-sp-ssf-client-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("generated")).unwrap();
+    std::fs::write(dir.join("generated/ssf-client.crt"), &cert).unwrap();
+    std::fs::write(dir.join("generated/ssf-client.key"), ec.serialize_pem()).unwrap();
+    let with = |ssf: serde_json::Value| {
+        let mut config = test_config(serde_json::Map::new(), "");
+        config.insert("idpCa".into(), json!(cert.clone()));
+        config.insert("ssf".into(), ssf);
+        crate::resolve_config(&config, dir.to_str().unwrap())
+    };
+    let separate = with(json!({"transmitter": "https://idp.test", "clientCertificate": "generated/ssf-client.crt", "clientKey": "file:generated/ssf-client.key"})).unwrap();
+    assert!(separate.ssf_client_is_separate());
+    let tls = separate.ssf_tls();
+    assert_eq!(tls.cert, cert, "the receiver presents the realm-issued certificate");
+    assert!(tls.key.contains("PRIVATE KEY") && tls.key != separate.private_key_pem, "with its own key, not the SAML one");
+    assert_eq!(tls.ca, separate.idp_ca, "idpCa still anchors the transmitter");
+    assert_eq!(separate.certificate_pem, plain.certificate_pem, "the SAML key pair is untouched (it stays in the metadata)");
+    rejects(with(json!({"clientCertificate": "generated/ssf-client.crt"})), "config", "go together");
+    rejects(with(json!({"clientKey": "generated/ssf-client.key"})), "config", "go together");
+    rejects(with(json!({"clientCertificate": "generated/missing.crt", "clientKey": "generated/ssf-client.key"})), "config", "ssf.clientCertificate is neither a PEM nor a readable file");
+    // Not a key at all (a certificate where the key goes); a key for another certificate is refused at the handshake.
+    rejects(with(json!({"clientCertificate": "generated/ssf-client.crt", "clientKey": "generated/ssf-client.crt"})), "config", "not a usable TLS client identity");
+    rejects(with(json!({"clientCertificate": 7, "clientKey": "generated/ssf-client.key"})), "config", "ssf.clientCertificate must be");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn resolve(config: serde_json::Map<String, serde_json::Value>) -> Result<crate::Config, crate::SamlError> {
+    crate::resolve_config(&config, "")
+}
+
+/// A generated SP key pair is named for what it is, never a bare host.
+#[test]
+fn a_generated_sp_certificate_names_the_demo_and_its_entity_id() {
+    use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
+    let subject = crate::service_provider_subject("saml2-sp-rust demo SP", "http://localhost:3000/saml/metadata");
+    let pair = crate::create_self_signed_key_pair_for(&subject, 1, 2048).unwrap();
+    let (_, cert) = X509Certificate::from_der(&pair.certificate_der).unwrap();
+    assert_eq!(cert.subject().to_string(), "CN=saml2-sp-rust demo SP, O=saml2-sp");
+    let san = cert.subject_alternative_name().unwrap().expect("a subjectAltName").value;
+    assert!(matches!(san.general_names.as_slice(), [GeneralName::URI("http://localhost:3000/saml/metadata")]), "{:?}", san.general_names);
+    let fallback = crate::service_provider_subject(" ", "not a uri");
+    assert_eq!((fallback.common_name.as_str(), fallback.uris.len()), ("saml2-sp service provider", 0));
+    assert_eq!(crate::create_self_signed_key_pair("x", 1, 2048).unwrap().certificate_pem.is_empty(), false, "the old entry point still works");
+}

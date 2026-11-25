@@ -30,7 +30,7 @@ pub use error::{SamlError, SamlStatus};
 pub use events::{caep_events, default_ending_events, default_events_requested, event, risc_events, subject_of};
 pub use http::TlsOptions;
 pub use jws::verify_compact_jws;
-pub use keys::{create_self_signed_key_pair, KeyMaterial};
+pub use keys::{create_self_signed_key_pair, create_self_signed_key_pair_for, service_provider_subject, CertificateSubject, KeyMaterial};
 pub use metadata::{metadata_document, read_idp_metadata, IdpMetadata};
 pub use provider::{AcsBody, LoginOptions, LoginRequest, ServiceProvider};
 pub use receiver::{ssf_add_subjects, Logger, ReceiverOptions, SignalEvent, SignalsReceiver};
