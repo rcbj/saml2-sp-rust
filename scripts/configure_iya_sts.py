@@ -55,7 +55,12 @@ PEP_NAME = "pep-saml-demo"
 PEP_KEY = "generated/pep-key.pem"
 PEP_GROUP = "remote-peps"
 PEP_EVENT = "urn:iya:sts:secevent:event-type:pep-policies-changed"
-ACR_ATTRIBUTE = "urn:saml-sp-demo:acr"
+# The realm's AuthZEN catalogue has ONE subject.acr row, shared by every
+# application in the realm, and each sibling demo's install script writes it.
+# So all four Rust demos use the same attribute id: a different one here was
+# overwritten by the next demo's run, after which this demo's policy found no
+# acr and denied every order.
+ACR_ATTRIBUTE = "urn:example:acr"
 # The demo's attribute-protected resource (GET /attribute-protected): the test user carries a custom
 # directory attribute, and the demo application's own policy permits the resource only to a person
 # whose attr1 is abc123. The PEP asks iya-sts's PIP for it (POST /xacml/pip): it is a directory
@@ -309,9 +314,26 @@ def files_of(config_path: str) -> DemoFiles:
     )
 
 
+DEMO_IMAGE = "saml2-sp-rust-demo"
+
+
 def _cli(args: list[str], input_text: str | None = None) -> str:
+    """Runs the saml2-sp command: the one on PATH, else the demo image's
+    (built with the embedded PEP, so a configuration with a `pep` section is
+    read), with the checkout mounted as its working directory. Never Cargo on
+    the host: that built a binary without the `pep` feature, which then
+    refused the configuration this script writes."""
     binary = shutil.which("saml2-sp")
-    command = [binary, *args] if binary else ["cargo", "run", "--quiet", "--bin", "saml2-sp", "--", *args]
+    if binary:
+        command = [binary, *args]
+    else:
+        docker = shutil.which("docker")
+        image_there = docker and subprocess.run([docker, "image", "inspect", DEMO_IMAGE], capture_output=True, check=False).returncode == 0
+        if not image_there:
+            raise SystemExit(f"saml2-sp is not on PATH and the demo image {DEMO_IMAGE} is not built: run `docker compose build` first.")
+        root = str(repo_root())
+        command = [docker, "run", "--rm", "-i", "--user", f"{os.getuid()}:{os.getgid()}", "--network", "host",
+                   "-v", f"{root}:{root}", "-w", root, "--entrypoint", "saml2-sp", DEMO_IMAGE, *args]
     proc = subprocess.run(
         command,
         cwd=repo_root(), input=input_text, capture_output=True, text=True, check=False,
