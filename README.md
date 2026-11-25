@@ -60,7 +60,7 @@ saml2-sp = { version = "…", features = ["local"] }  # local too: decided in pr
 match sp.decide_session(&receiver.session_index(), &local_id, &login, &Access::new("read", "order", "42")) {
     Decision::Permit { obligations, .. } => { /* discharge them, then serve */ }
     Decision::Deny { .. } => { /* 403 */ }
-    Decision::Unavailable { .. } => { /* 503: fail closed, never a Permit */ }
+    Decision::Unavailable { .. } => { /* 403: fail closed, never a Permit */ }
 }
 ```
 

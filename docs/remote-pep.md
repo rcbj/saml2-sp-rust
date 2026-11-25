@@ -166,7 +166,7 @@ let access = Access::new("read", "order", order_id);
 match sp.decide_session(&receiver.session_index(), &local_id, &login, &access) {
     Decision::Permit { obligations, .. } => serve(obligations),
     Decision::Deny { why } => forbidden(&why),          // 403
-    Decision::Unavailable { why } => unavailable(&why), // 503: fail closed
+    Decision::Unavailable { why } => forbidden(&why),   // 403: fail closed
 }
 // Without a receiver: sp.decide(&login, &access)
 ```
@@ -237,7 +237,7 @@ The live run found two differences, both about an application that enforces fine
 
 ## The demo
 
-Built with `local` (the Dockerfile does), the demo protects `GET /orders/<id>` with the PEP when `demo/saml.json` has a `pep` section: 401 without a sign-in, 200 on a Permit, 403 on a Deny and 503 on `Unavailable`.
+Built with `local` (the Dockerfile does), the demo protects `GET /orders/<id>` with the PEP when `demo/saml.json` has a `pep` section: 401 without a sign-in, 200 on a Permit, and 403 on a Deny and on `Unavailable` (any PEP failure is a 403: the page says the PEP could not decide).
 
 One command sets the demo up with its PEP: the install script with `--pep local` (or a bare `--pep`, local being the default) or `--pep central` (and `--pep-name`, default `pep-saml-demo`). After registering the service provider it does steps 2 to 6: the service account in `remote-peps`; a P-256 key made with `openssl` in `demo/generated/pep-key.pem` (0600, never printed, never in the image), certified and bound to the demo's application; the catalogue row `subject.acr` (`AuthnContextClassRef`, as `urn:saml-sp-demo:acr`); and the demo application's own policy, which it enforces, permitting `read` on an `order` when the sign-in carried an `AuthnContextClassRef` and denying everything else. The realm root is never touched. It then writes the `pep` section (`name`, `mode`, `assertionKey: generated/pep-key.pem`) into `demo/saml.json`, keeping the other members. `--dry-run` lists every call.
 

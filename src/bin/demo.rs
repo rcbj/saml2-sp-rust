@@ -317,8 +317,9 @@ fn route(app: &App, req: &Request) -> Response {
 /// A route the embedded PEP protects (the `pep` feature, iya-sts#1206): the
 /// signed-in person's access to one order, decided by the `pep` section's
 /// PEP from the validated assertion. A GET is `read` and anything else
-/// `write`. No sign-in is 401, a Deny 403, and a decision that couldn't be
-/// made 503: never served.
+/// `write`. No sign-in is 401, a Deny 403, and any other PEP failure 403
+/// too (no decision, or no service provider to ask): an enforcement point
+/// that cannot say yes says no, and the page says which. Never served.
 #[cfg(feature = "pep")]
 fn order(app: &App, req: &Request, id: &str) -> Response {
     use saml2_sp::pep::{Access, Decision};
@@ -327,7 +328,7 @@ fn order(app: &App, req: &Request, id: &str) -> Response {
     };
     let sp = match provider(app) {
         Ok(sp) => sp,
-        Err(error) => return page_html("Unavailable", &format!("<h1>The service provider is not configured</h1><p class=\"problem\">{}</p>", escape(&error)), 503),
+        Err(error) => return page_html("Forbidden", &format!("<h1>Not allowed</h1><p class=\"problem\">No decision could be asked for: the service provider is not configured: {}</p>", escape(&error)), 403),
     };
     let action = if req.method == "GET" { "read" } else { "write" };
     match sp.decide(&held.login, &Access::new(action, "order", id)) {
@@ -336,7 +337,7 @@ fn order(app: &App, req: &Request, id: &str) -> Response {
             page_html("Order", &format!("<h1>Order {}</h1><p>The PEP permitted <code>{action}</code>.</p>{note}", escape(id)), 200)
         }
         Decision::Deny { why } => page_html("Forbidden", &format!("<h1>Not allowed</h1><p>The PEP denied <code>{action}</code> on order {}: {}</p>", escape(id), escape(&why)), 403),
-        Decision::Unavailable { why } => page_html("Unavailable", &format!("<h1>No decision</h1><p>The PEP could not decide: {}</p>", escape(&why)), 503),
+        Decision::Unavailable { why } => page_html("Forbidden", &format!("<h1>No decision</h1><p>The PEP could not decide: {}</p>", escape(&why)), 403),
     }
 }
 
