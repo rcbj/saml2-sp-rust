@@ -119,7 +119,7 @@ saml2-sp = { version = "…", features = ["pep"] }    # central
 saml2-sp = { version = "…", features = ["local"] }  # local (includes central)
 ```
 
-Without the feature a `pep` section is refused when the configuration is read, rather than silently ignored. A section that names no `mode` is `local`, so a build with `pep` alone must say `"mode": "central"`; it refuses a section that leaves the mode out.
+Without the feature a `pep` section is refused when the configuration is read, rather than silently ignored. A section that names no `mode` is `local`, so a build with `pep` alone must name `"mode": "central"`; otherwise it is refused the same way.
 
 ## Configure
 
